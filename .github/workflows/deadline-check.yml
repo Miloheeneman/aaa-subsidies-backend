@@ -1,0 +1,52 @@
+name: Deadline check
+
+# Runs every weekday at 08:00 UTC and dispatches a POST against the
+# admin /run-deadline-check endpoint, which iterates every active
+# aanvraag and emails any client whose subsidie-deadline is at most 14
+# days away or already verlopen. Cooldown logic lives in
+# backend/app/services/deadline_service.py so this can safely run daily.
+on:
+  schedule:
+    - cron: "0 8 * * 1-5"
+  workflow_dispatch: {}
+
+jobs:
+  run-deadline-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Login & trigger deadline check
+        env:
+          API_URL: ${{ secrets.AAA_SUBSIDIES_API_URL }}
+          ADMIN_EMAIL: ${{ secrets.AAA_SUBSIDIES_ADMIN_EMAIL }}
+          ADMIN_PASSWORD: ${{ secrets.AAA_SUBSIDIES_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${API_URL:-}" || -z "${ADMIN_EMAIL:-}" || -z "${ADMIN_PASSWORD:-}" ]]; then
+            echo "Missing one of AAA_SUBSIDIES_API_URL / _ADMIN_EMAIL / _ADMIN_PASSWORD secrets" >&2
+            exit 1
+          fi
+
+          API_URL="${API_URL%/}"
+
+          echo "==> Logging in as $ADMIN_EMAIL"
+          login_body=$(jq -n --arg e "$ADMIN_EMAIL" --arg p "$ADMIN_PASSWORD" \
+            '{email:$e, password:$p}')
+
+          token=$(curl -fsS -X POST "$API_URL/api/v1/auth/login" \
+            -H "Content-Type: application/json" \
+            -d "$login_body" \
+          | jq -r '.access_token')
+
+          if [[ -z "$token" || "$token" == "null" ]]; then
+            echo "Could not obtain JWT token" >&2
+            exit 1
+          fi
+
+          echo "==> Triggering deadline check"
+          response=$(curl -fsS -X POST \
+            "$API_URL/api/v1/admin/run-deadline-check" \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json")
+
+          echo "Result:"
+          echo "$response" | jq .
