@@ -1,7 +1,7 @@
 import logging
 import os
 from functools import lru_cache
-from typing import List
+from typing import List, Union
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -39,9 +39,45 @@ class Settings(BaseSettings):
     APP_NAME: str = "AAA-Subsidies"
     API_V1_PREFIX: str = "/api/v1"
     FRONTEND_URL: str = "http://localhost:5173"
-    BACKEND_CORS_ORIGINS: List[str] = Field(
-        default_factory=lambda: ["http://localhost:5173"]
+    # Typed as Union[str, List[str]] so pydantic-settings doesn't try to
+    # JSON-decode the env var before our validator runs (Railway often
+    # has bare comma-separated or single-URL values that would otherwise
+    # crash app startup).
+    BACKEND_CORS_ORIGINS: Union[str, List[str]] = Field(
+        default_factory=lambda: [
+            "http://localhost:5173",
+            "https://aaa-subsidies-frontend.vercel.app",
+        ]
     )
+    # Allows Vercel preview deployments (e.g.
+    # aaa-subsidies-frontend-abc123-real-edge.vercel.app) to talk to the API.
+    # Set to "" or None in env to disable.
+    BACKEND_CORS_ORIGIN_REGEX: str = (
+        r"https://aaa-subsidies-frontend(-[a-z0-9-]+)?\.vercel\.app"
+    )
+
+    @field_validator("BACKEND_CORS_ORIGINS", mode="before")
+    @classmethod
+    def _split_cors_origins(cls, value):
+        # Accept any of: real list, JSON list string, comma-separated,
+        # or a single bare URL. Railway's UI strips quotes from JSON,
+        # so be lenient.
+        if value is None or value == "":
+            return ["http://localhost:5173"]
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()]
+        if isinstance(value, str):
+            v = value.strip()
+            if v.startswith("["):
+                import json
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        return [str(x).strip() for x in parsed if str(x).strip()]
+                except json.JSONDecodeError:
+                    pass
+            return [s.strip() for s in v.split(",") if s.strip()]
+        return value
 
     DATABASE_URL: str = "postgresql+psycopg://postgres:postgres@localhost:5432/aaa_subsidies"
 
