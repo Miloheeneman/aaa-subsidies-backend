@@ -63,6 +63,11 @@ def _ok(resp: httpx.Response, *expected: int) -> dict:
 
 
 def register(client, email: str, *, org_type: str = "klant") -> str:
+    # The public /auth/register only ever produces klant accounts (see
+    # STAP 5 — "installateur uit registratie"). When the test asks for
+    # an installateur we register as klant, then promote the user and
+    # their organisation via the DB to match the legacy behaviour this
+    # suite was originally written against.
     _ok(
         client.post(
             "/auth/register",
@@ -73,13 +78,21 @@ def register(client, email: str, *, org_type: str = "klant") -> str:
                 "last_name": "User",
                 "phone": "+31612345678",
                 "organisation_name": f"Org {email}",
-                "organisation_type": org_type,
             },
         ),
         201,
     )
     with SessionLocal() as db:
         u = db.query(User).filter(User.email == email).one()
+        if org_type == "installateur":
+            u.role = UserRole.installateur
+            org = (
+                db.query(Organisation)
+                .filter(Organisation.id == u.organisation_id)
+                .one()
+            )
+            org.type = OrganisationType.installateur
+            db.commit()
         token = create_email_verification_token(str(u.id))
     _ok(client.post(f"/auth/verify-email/{token}"))
     return _ok(

@@ -112,7 +112,13 @@ class Settings(BaseSettings):
     # Legacy aliases (kept for compatibility with .env.example).
     STRIPE_PRICE_BASIC: str = ""
     STRIPE_PRICE_PRO: str = ""
-    # New per-plan price IDs used by the installateur subscription flow.
+    # Per-plan price IDs. Multiple naming schemes accepted so the same
+    # config works for the (legacy) installateur flow and the new
+    # klant-onboarding flow. STRIPE_PRICE_STARTER / STRIPE_PRICE_PRO
+    # are the canonical names (see the product spec for onboarding).
+    # STRIPE_STARTER_PRICE_ID / STRIPE_PRO_PRICE_ID / STRIPE_PRICE_BASIC
+    # are kept as fallbacks.
+    STRIPE_PRICE_STARTER: str = ""
     STRIPE_STARTER_PRICE_ID: str = ""
     STRIPE_PRO_PRICE_ID: str = ""
 

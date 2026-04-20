@@ -60,9 +60,15 @@ def init_stripe() -> None:
 
 
 def price_id_for_plan(plan: str) -> str:
+    # Accept three naming schemes so Railway / Vercel env-var config
+    # from any of the product iterations keeps working:
+    #   STRIPE_PRICE_STARTER / STRIPE_PRICE_PRO   (current spec)
+    #   STRIPE_STARTER_PRICE_ID / STRIPE_PRO_PRICE_ID
+    #   STRIPE_PRICE_BASIC / STRIPE_PRICE_PRO     (first iteration)
     if plan == PLAN_STARTER:
         return (
-            settings.STRIPE_STARTER_PRICE_ID
+            settings.STRIPE_PRICE_STARTER
+            or settings.STRIPE_STARTER_PRICE_ID
             or settings.STRIPE_PRICE_BASIC
         )
     if plan == PLAN_PRO:
@@ -132,6 +138,57 @@ def create_checkout_session(
     return CheckoutSessionResult(url=session.url, session_id=session.id)
 
 
+def create_checkout_session_for_user(
+    *,
+    plan: str,
+    user_id: str,
+    customer_email: str,
+    existing_customer_id: Optional[str] = None,
+) -> CheckoutSessionResult:
+    """Create a Stripe Checkout session for a klant-level subscription.
+
+    Variant of :func:`create_checkout_session` that tags the session
+    with ``user_id`` metadata (instead of ``organisation_id``) and
+    redirects back to the onboarding success / plan-picker pages. The
+    Stripe webhook routes these events based on which metadata key is
+    present — see :mod:`app.api.routes.stripe_routes`.
+    """
+    if plan not in ALLOWED_PLANS:
+        raise ValueError(f"Onbekend abonnementsplan: {plan}")
+
+    init_stripe()
+    price_id = price_id_for_plan(plan)
+    if not price_id:
+        raise RuntimeError(
+            f"Stripe price ID voor plan '{plan}' is niet geconfigureerd"
+        )
+
+    success_url = _frontend_url(
+        "/onboarding/success?session_id={CHECKOUT_SESSION_ID}"
+    )
+    cancel_url = _frontend_url("/onboarding/plan?cancelled=true")
+
+    kwargs = {
+        "mode": "subscription",
+        "line_items": [{"price": price_id, "quantity": 1}],
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "metadata": {"user_id": user_id, "plan": plan},
+        "subscription_data": {
+            "metadata": {"user_id": user_id, "plan": plan},
+        },
+        "allow_promotion_codes": True,
+    }
+    if existing_customer_id:
+        kwargs["customer"] = existing_customer_id
+    else:
+        kwargs["customer_email"] = customer_email
+        kwargs["customer_creation"] = "always"
+
+    session = stripe.checkout.Session.create(**kwargs)
+    return CheckoutSessionResult(url=session.url, session_id=session.id)
+
+
 def create_customer_portal_session(
     *, customer_id: str, return_path: str = "/installateur/abonnement"
 ) -> PortalSessionResult:
@@ -163,10 +220,14 @@ def plan_from_price_id(price_id: Optional[str]) -> Optional[str]:
     """Reverse-map a price ID to our internal plan code."""
     if not price_id:
         return None
-    starter = settings.STRIPE_STARTER_PRICE_ID or settings.STRIPE_PRICE_BASIC
-    pro = settings.STRIPE_PRO_PRICE_ID or settings.STRIPE_PRICE_PRO
-    if price_id == starter:
+    starter_ids = {
+        settings.STRIPE_PRICE_STARTER,
+        settings.STRIPE_STARTER_PRICE_ID,
+        settings.STRIPE_PRICE_BASIC,
+    }
+    pro_ids = {settings.STRIPE_PRO_PRICE_ID, settings.STRIPE_PRICE_PRO}
+    if price_id in starter_ids:
         return PLAN_STARTER
-    if price_id == pro:
+    if price_id in pro_ids:
         return PLAN_PRO
     return None

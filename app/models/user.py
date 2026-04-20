@@ -44,6 +44,21 @@ class User(UUIDPKMixin, TimestampMixin, Base):
 
     verified: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
 
+    # Per-user subscription tracking (new klant-onboarding flow).
+    # See app.models.enums.SubscriptionPlan for the allowed values.
+    # subscription_status is a free-form string that mirrors Stripe's own
+    # statuses (active, past_due, canceled, …) plus our own "pending"
+    # for the interval between checkout and the webhook confirmation.
+    subscription_plan: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="gratis", server_default="gratis"
+    )
+    subscription_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="active", server_default="active"
+    )
+    stripe_customer_id: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True, index=True
+    )
+
     organisation: Mapped[Optional["Organisation"]] = relationship(
         back_populates="users",
         foreign_keys=[organisation_id],

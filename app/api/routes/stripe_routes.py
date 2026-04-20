@@ -206,6 +206,46 @@ def _apply_subscription_state(
     db.commit()
 
 
+def _apply_user_subscription_state(
+    db,
+    *,
+    user_id: Optional[str],
+    customer_id: Optional[str],
+    plan=_UNSET,
+    status_str=_UNSET,
+) -> None:
+    """Update a user row from a Stripe payload.
+
+    Used by the klant-onboarding flow where the Checkout session was
+    tagged with ``metadata.user_id`` instead of ``organisation_id``.
+    """
+    user: Optional[User] = None
+    if user_id:
+        user = db.execute(
+            select(User).where(User.id == user_id)
+        ).scalar_one_or_none()
+    if user is None and customer_id:
+        user = db.execute(
+            select(User).where(User.stripe_customer_id == customer_id)
+        ).scalar_one_or_none()
+    if user is None:
+        logger.warning(
+            "Stripe webhook: kon geen user matchen "
+            "(user_id=%s customer_id=%s)",
+            user_id,
+            customer_id,
+        )
+        return
+
+    if customer_id:
+        user.stripe_customer_id = customer_id
+    if plan is not _UNSET and plan is not None:
+        user.subscription_plan = plan
+    if status_str is not _UNSET and status_str is not None:
+        user.subscription_status = status_str
+    db.commit()
+
+
 @router.post(
     "/webhook",
     summary="Stripe webhook handler (signature-verified)",
@@ -236,19 +276,39 @@ async def stripe_webhook(
     )
     metadata = data_obj.get("metadata") or {}
     organisation_id = metadata.get("organisation_id")
+    user_id = metadata.get("user_id")
     plan_meta = metadata.get("plan")
     customer_id = data_obj.get("customer") if isinstance(data_obj, dict) else None
+
+    # A session/subscription is either tagged with user_id (new klant
+    # onboarding flow) or organisation_id (legacy installateur flow).
+    # Route the update to the right handler; fall back to the org
+    # handler when neither is present but a customer_id is — that lets
+    # Stripe-initiated events (e.g. customer.subscription.updated
+    # triggered from the Customer Portal) still land on the right row.
+    def _dispatch(plan=_UNSET, status_str=_UNSET) -> None:
+        if user_id:
+            _apply_user_subscription_state(
+                db,
+                user_id=user_id,
+                customer_id=customer_id,
+                plan=plan,
+                status_str=status_str,
+            )
+            return
+        _apply_subscription_state(
+            db,
+            organisation_id=organisation_id,
+            customer_id=customer_id,
+            plan=plan,
+            status_str=status_str,
+        )
 
     if event_type == "checkout.session.completed":
         kwargs = {"status_str": "active"}
         if plan_meta:
             kwargs["plan"] = plan_meta
-        _apply_subscription_state(
-            db,
-            organisation_id=organisation_id,
-            customer_id=customer_id,
-            **kwargs,
-        )
+        _dispatch(**kwargs)
     elif event_type == "customer.subscription.updated":
         # Try to derive plan from price ID if metadata is empty.
         plan = plan_meta
@@ -262,20 +322,26 @@ async def stripe_webhook(
             kwargs["plan"] = plan
         if new_status:
             kwargs["status_str"] = new_status
-        _apply_subscription_state(
-            db,
-            organisation_id=organisation_id,
-            customer_id=customer_id,
-            **kwargs,
-        )
+        _dispatch(**kwargs)
     elif event_type == "customer.subscription.deleted":
-        _apply_subscription_state(
-            db,
-            organisation_id=organisation_id,
-            customer_id=customer_id,
-            plan=None,
-            status_str="cancelled",
-        )
+        # On cancellation we drop klant users back to gratis; for orgs
+        # we clear the plan (legacy behaviour preserved).
+        if user_id:
+            _apply_user_subscription_state(
+                db,
+                user_id=user_id,
+                customer_id=customer_id,
+                plan="gratis",
+                status_str="cancelled",
+            )
+        else:
+            _apply_subscription_state(
+                db,
+                organisation_id=organisation_id,
+                customer_id=customer_id,
+                plan=None,
+                status_str="cancelled",
+            )
     else:
         logger.info("Stripe webhook: ongebruikt event %s", event_type)
 

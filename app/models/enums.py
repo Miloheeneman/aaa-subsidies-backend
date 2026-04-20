@@ -73,3 +73,17 @@ class LeadStatus(str, enum.Enum):
     contact_opgenomen = "contact_opgenomen"
     gewonnen = "gewonnen"
     verloren = "verloren"
+
+
+class SubscriptionPlan(str, enum.Enum):
+    """Klant-facing abonnementsplannen (zie /onboarding/plan)."""
+
+    gratis = "gratis"
+    starter = "starter"
+    pro = "pro"
+    enterprise = "enterprise"
+
+
+# Plans that go through Stripe Checkout. ``gratis`` is set automatically
+# at registration and ``enterprise`` is a mailto-CTA handled in the UI.
+PAID_PLANS = frozenset({SubscriptionPlan.starter.value, SubscriptionPlan.pro.value})

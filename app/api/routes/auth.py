@@ -34,18 +34,21 @@ from app.services.email import send_password_reset_email, send_verification_emai
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
-def _role_for_org_type(org_type: OrganisationType) -> UserRole:
-    if org_type is OrganisationType.installateur:
-        return UserRole.installateur
-    return UserRole.klant
-
-
 @router.post(
     "/register",
     response_model=MessageResponse,
     status_code=status.HTTP_201_CREATED,
 )
 def register(payload: RegisterRequest, db: DbSession) -> MessageResponse:
+    """Register a new klant account.
+
+    The platform is a klant portal — installateur accounts are created
+    by an admin, not through this endpoint. ``organisation_type`` on the
+    request is accepted but ignored; every account becomes role=klant.
+    ``organisation_name`` is optional; if omitted we generate a private
+    "personal" org named after the user so downstream relationships
+    (aanvragen, documents, …) keep working.
+    """
     email_normalized = payload.email.lower().strip()
 
     existing = db.execute(
@@ -57,12 +60,16 @@ def register(payload: RegisterRequest, db: DbSession) -> MessageResponse:
             detail="Er bestaat al een account met dit e-mailadres",
         )
 
-    org_type = OrganisationType(payload.organisation_type)
-    role = _role_for_org_type(org_type)
+    first_name = payload.first_name.strip()
+    last_name = payload.last_name.strip()
+
+    org_name = (payload.organisation_name or "").strip()
+    if not org_name:
+        org_name = f"{first_name} {last_name}".strip() or email_normalized
 
     organisation = Organisation(
-        name=payload.organisation_name.strip(),
-        type=org_type,
+        name=org_name,
+        type=OrganisationType.klant,
     )
     db.add(organisation)
     db.flush()
@@ -70,12 +77,14 @@ def register(payload: RegisterRequest, db: DbSession) -> MessageResponse:
     user = User(
         email=email_normalized,
         password_hash=hash_password(payload.password),
-        role=role,
-        first_name=payload.first_name.strip(),
-        last_name=payload.last_name.strip(),
+        role=UserRole.klant,
+        first_name=first_name,
+        last_name=last_name,
         phone=payload.phone.strip() if payload.phone else None,
         organisation_id=organisation.id,
         verified=False,
+        subscription_plan="gratis",
+        subscription_status="active",
     )
     db.add(user)
 

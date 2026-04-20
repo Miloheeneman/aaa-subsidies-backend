@@ -42,7 +42,6 @@ def register_and_verify(client, email: str) -> str:
                 "last_name": "User",
                 "phone": "+31612345678",
                 "organisation_name": f"Org {email}",
-                "organisation_type": "klant",
             },
         ),
         201,

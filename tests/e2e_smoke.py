@@ -53,7 +53,6 @@ def main() -> None:
                 "last_name": "Klant",
                 "phone": "+31612345678",
                 "organisation_name": "Testklant BV",
-                "organisation_type": "klant",
             },
         ),
         201,
@@ -162,7 +161,6 @@ def main() -> None:
             "first_name": "X",
             "last_name": "Y",
             "organisation_name": "Dup BV",
-            "organisation_type": "klant",
         },
     )
     assert r.status_code == 409, r.text

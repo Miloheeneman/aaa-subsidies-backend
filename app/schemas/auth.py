@@ -10,13 +10,20 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field
 # ---------- Requests ----------
 
 class RegisterRequest(BaseModel):
+    # The platform is a klant portal — there is no public "ik ben een
+    # installateur" branch anymore. Every registration creates a klant
+    # account; admins are promoted manually via SQL. organisation_name
+    # is optional because a lot of users are particulieren, not bedrijven.
+    # organisation_type is still accepted (and optional) so older API
+    # clients and our internal test harnesses don't break, but it is
+    # ignored unless the value is "klant".
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
     first_name: str = Field(min_length=1, max_length=128)
     last_name: str = Field(min_length=1, max_length=128)
     phone: Optional[str] = Field(default=None, max_length=32)
-    organisation_name: str = Field(min_length=1, max_length=255)
-    organisation_type: Literal["klant", "installateur"]
+    organisation_name: Optional[str] = Field(default=None, max_length=255)
+    organisation_type: Optional[Literal["klant", "installateur"]] = None
 
 
 class LoginRequest(BaseModel):
@@ -61,6 +68,8 @@ class UserOut(BaseModel):
     phone: Optional[str] = None
     verified: bool
     organisation_id: Optional[UUID] = None
+    subscription_plan: str = "gratis"
+    subscription_status: str = "active"
     created_at: datetime
 
 
