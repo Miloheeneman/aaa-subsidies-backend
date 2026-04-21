@@ -23,6 +23,7 @@ from app.api.deps import CurrentUser, DbSession, require_verified
 from app.models import (
     Maatregel,
     MaatregelDocument,
+    Organisation,
     Pand,
     User,
 )
@@ -54,6 +55,7 @@ from app.services import r2_storage
 from app.services.panden_service import (
     allowed_document_types,
     calculate_deadline,
+    estimate_subsidie,
     get_required_documents,
     infer_regeling,
 )
@@ -157,6 +159,21 @@ def _recalc_deadline(m: Maatregel) -> None:
     m.deadline_status = result.deadline_status
 
 
+def _auto_estimate_subsidie(
+    m: Maatregel, *, overwrite: bool = False
+) -> None:
+    """Vul geschatte_subsidie zodra we de input hebben.
+
+    Overschrijft alleen als ``overwrite=True`` (bij PUT als de klant
+    expliciet een bedrag doorgeeft krijgt die voorrang).
+    """
+    if not overwrite and m.geschatte_subsidie is not None:
+        return
+    est = estimate_subsidie(m.maatregel_type, m.investering_bedrag)
+    if est is not None:
+        m.geschatte_subsidie = est
+
+
 # ---------------------------------------------------------------------------
 # Panden CRUD
 # ---------------------------------------------------------------------------
@@ -194,10 +211,24 @@ def list_panden(
         for m in rows:
             maatregelen_per_pand[m.pand_id].append(m)
 
-    items = [
-        _pand_to_out(p, maatregelen=maatregelen_per_pand.get(p.id, []))
-        for p in panden
-    ]
+    # Admins krijgen de organisatie-naam mee zodat het admin-overzicht per
+    # rij kan tonen van welke klant het pand is.
+    org_names: dict[UUID, str] = {}
+    if _is_admin(user) and panden:
+        org_ids = {p.organisation_id for p in panden}
+        rows = db.execute(
+            select(Organisation.id, Organisation.name).where(
+                Organisation.id.in_(org_ids)
+            )
+        ).all()
+        org_names = {row[0]: row[1] for row in rows}
+
+    items = []
+    for p in panden:
+        out = _pand_to_out(p, maatregelen=maatregelen_per_pand.get(p.id, []))
+        if _is_admin(user):
+            out.organisation_name = org_names.get(p.organisation_id)
+        items.append(out)
     if deadline_status is not None:
         items = [i for i in items if i.worst_deadline_status == deadline_status]
 
@@ -401,6 +432,7 @@ def create_maatregel(
         regeling_code=payload.regeling_code or infer_regeling(payload.maatregel_type),
     )
     _recalc_deadline(m)
+    _auto_estimate_subsidie(m)
     db.add(m)
     db.commit()
     db.refresh(m)
@@ -439,6 +471,10 @@ def update_maatregel(
         setattr(m, field, value)
 
     _recalc_deadline(m)
+    # Als de klant geen expliciete schatting meestuurt, recalculeren we;
+    # stuurt de klant wel een bedrag mee, dan respecteren we dat.
+    if "geschatte_subsidie" not in data:
+        _auto_estimate_subsidie(m, overwrite=True)
     db.commit()
     db.refresh(m)
     return MaatregelOut.model_validate(m)

@@ -98,6 +98,7 @@ class PandOut(BaseModel):
     # Afgeleid, ingevuld door de route
     aantal_maatregelen: int = 0
     worst_deadline_status: Optional[DeadlineStatus] = None
+    organisation_name: Optional[str] = None  # alleen gevuld voor admins
 
 
 class PandListResponse(BaseModel):

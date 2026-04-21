@@ -170,6 +170,8 @@ _WARMTEPOMP_TYPES = {
     MaatregelType.warmtepomp_lucht_water,
     MaatregelType.warmtepomp_water_water,
     MaatregelType.warmtepomp_hybride,
+}
+_ZONNEBOILER_TYPES = {
     MaatregelType.zonneboiler,
 }
 _ISOLATIE_TYPES = {
@@ -183,7 +185,7 @@ _ISOLATIE_TYPES = {
 _DOC_LABELS: dict[MaatregelDocumentType, tuple[str, str]] = {
     MaatregelDocumentType.factuur: (
         "Factuur",
-        "Factuur met meldcode en installatiedatum.",
+        "Factuur met installatiedatum en meldcode.",
     ),
     MaatregelDocumentType.betaalbewijs: (
         "Betaalbewijs",
@@ -195,7 +197,7 @@ _DOC_LABELS: dict[MaatregelDocumentType, tuple[str, str]] = {
     ),
     MaatregelDocumentType.foto_werkzaamheden: (
         "Foto tijdens werkzaamheden",
-        "Foto tijdens werkzaamheden — naam, merk en dikte materiaal zichtbaar.",
+        "Naam, merk en dikte van het isolatiemateriaal moeten zichtbaar zijn.",
     ),
     MaatregelDocumentType.inbedrijfstelling: (
         "Inbedrijfstellingsformulier",
@@ -210,8 +212,8 @@ _DOC_LABELS: dict[MaatregelDocumentType, tuple[str, str]] = {
         "Recent uittreksel van de Kamer van Koophandel (< 3 maanden oud).",
     ),
     MaatregelDocumentType.machtiging: (
-        "Machtiging",
-        "Machtigingsformulier dat AAA-Lex als intermediair kan indienen.",
+        "Machtiging namens klant",
+        "Machtigingsformulier waarmee AAA-Lex als intermediair kan indienen.",
     ),
     MaatregelDocumentType.overig: (
         "Overig",
@@ -233,7 +235,7 @@ def get_required_documents(
     maatregel_type: MaatregelType,
 ) -> List[ChecklistItem]:
     """Return the ordered checklist for one maatregel type."""
-    if maatregel_type in _WARMTEPOMP_TYPES:
+    if maatregel_type in _WARMTEPOMP_TYPES | _ZONNEBOILER_TYPES:
         return [
             _mk(MaatregelDocumentType.factuur),
             _mk(MaatregelDocumentType.betaalbewijs),
@@ -281,3 +283,59 @@ def allowed_document_types(
     base = {c.document_type for c in get_required_documents(maatregel_type)}
     base.add(MaatregelDocumentType.overig)
     return base
+
+
+# ---------------------------------------------------------------------------
+# Subsidie schatting
+# ---------------------------------------------------------------------------
+
+
+# Vaste bedragen + percentages; alle drempels zijn conservatief volgens
+# de 2025 RVO-tabellen. AAA-Lex overschrijft dit bedrag handmatig zodra
+# de echte ``toegekende_subsidie`` binnen is.
+_FLAT_AMOUNTS: dict[MaatregelType, float] = {
+    MaatregelType.warmtepomp_lucht_water: 2500.0,
+    MaatregelType.warmtepomp_water_water: 3500.0,
+    MaatregelType.warmtepomp_hybride: 1500.0,
+}
+
+# (percentage, cap) — cap=None voor "geen plafond".
+_PCT_AMOUNTS: dict[MaatregelType, tuple[float, Optional[float]]] = {
+    MaatregelType.dakisolatie: (0.20, 3000.0),
+    MaatregelType.gevelisolatie: (0.20, 2500.0),
+    MaatregelType.vloerisolatie: (0.20, 1500.0),
+    MaatregelType.hr_glas: (0.20, 2000.0),
+    MaatregelType.zonneboiler: (0.20, 2000.0),
+    MaatregelType.eia_investering: (0.455, None),
+    MaatregelType.mia_vamil_investering: (0.36, None),
+    MaatregelType.dumava_maatregel: (0.30, None),
+}
+
+
+def estimate_subsidie(
+    maatregel_type: MaatregelType,
+    investering_bedrag: Optional[float],
+) -> Optional[float]:
+    """Geef een conservatieve schatting van de subsidie terug.
+
+    * Warmtepompen krijgen een vast bedrag (ISDE-tabel).
+    * Isolatie/HR++ glas en zonneboiler: 20 % van de investering, plafond
+      per maatregel.
+    * EIA/MIA/Vamil/DUMAVA: percentage van de investering zonder plafond
+      (daar bepaalt het belastingvoordeel de werkelijke waarde — de
+      frontend toont 'geschat').
+
+    Return ``None`` als we geen schatting kunnen maken (bijv. EIA zonder
+    investering_bedrag) zodat de UI geen fantasiegetal toont.
+    """
+    if maatregel_type in _FLAT_AMOUNTS:
+        return _FLAT_AMOUNTS[maatregel_type]
+    if maatregel_type in _PCT_AMOUNTS:
+        if investering_bedrag is None or investering_bedrag <= 0:
+            return None
+        pct, cap = _PCT_AMOUNTS[maatregel_type]
+        raw = round(investering_bedrag * pct, 2)
+        if cap is not None and raw > cap:
+            return float(cap)
+        return float(raw)
+    return None
