@@ -1,353 +1,785 @@
-"""Panden CRUD + maatregelen binnen een pand."""
+"""Panden + maatregelen + maatregel-documenten endpoints (STAP 9).
 
+Een klant ziet en bewerkt alleen panden van de eigen organisatie; een
+admin ziet panden van alle klanten en kan AAA-Lex-only velden vullen
+(energielabels, notities, documenten verifiëren).
+
+De deadline engine wordt op elke POST/PUT van een maatregel opnieuw
+uitgevoerd zodat de lijstweergave zonder berekeningen direct de juiste
+kleur kan tonen.
+"""
 from __future__ import annotations
 
-from typing import Annotated, Optional
-from uuid import UUID
+import logging
+from datetime import datetime, timezone
+from typing import Annotated, List, Optional
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import and_, func, select
-from sqlalchemy.orm import selectinload
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
 from app.api.deps import CurrentUser, DbSession, require_verified
-from app.api.routes._panden_common import (
-    can_access_pand,
-    enforce_pand_limit,
-    get_pand_or_404,
-    is_admin,
+from app.models import (
+    Maatregel,
+    MaatregelDocument,
+    Pand,
+    User,
 )
-from app.models import Maatregel, Organisation, Pand, User
 from app.models.enums import (
     DeadlineStatus,
-    EigenaarType,
-    Energielabel,
-    PandType,
+    MaatregelDocumentType,
+    MaatregelStatus,
+    MaatregelType,
     UserRole,
 )
 from app.schemas.panden import (
-    MaatregelListItem,
+    ChecklistItemOut,
+    ChecklistResponse,
+    DocumentOut,
+    MaatregelCreate,
+    MaatregelOut,
+    MaatregelShort,
+    MaatregelUpdate,
     PandCreate,
-    PandDetail,
-    PandListItem,
+    PandDetailResponse,
+    PandListResponse,
     PandOut,
     PandUpdate,
+    QuotaInfo,
+    UploadUrlRequest,
+    UploadUrlResponse,
 )
-from app.services import panden_deadline
+from app.services import r2_storage
+from app.services.panden_service import (
+    allowed_document_types,
+    calculate_deadline,
+    get_required_documents,
+    infer_regeling,
+)
+from app.services.plan_service import get_quota
 
-router = APIRouter(prefix="/panden", tags=["panden"])
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["panden"])
 
 VerifiedUser = Annotated[User, Depends(require_verified)]
 
 
 # ---------------------------------------------------------------------------
-# Mapping helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-_DEADLINE_PRIORITY = {
-    DeadlineStatus.verlopen: 4,
-    DeadlineStatus.kritiek: 3,
-    DeadlineStatus.waarschuwing: 2,
-    DeadlineStatus.ok: 1,
-}
+def _is_admin(user: User) -> bool:
+    return user.role == UserRole.admin
 
 
-def _pand_out(pand: Pand) -> PandOut:
-    org_name = pand.organisation.name if pand.organisation is not None else None
-    return PandOut(
-        id=pand.id,
-        organisation_id=pand.organisation_id,
-        organisation_name=org_name,
-        created_by=pand.created_by,
-        straat=pand.straat,
-        huisnummer=pand.huisnummer,
-        postcode=pand.postcode,
-        plaats=pand.plaats,
-        bouwjaar=pand.bouwjaar,
-        pand_type=pand.pand_type.value,
-        eigenaar_type=pand.eigenaar_type.value,
-        energielabel_huidig=(
-            pand.energielabel_huidig.value
-            if pand.energielabel_huidig is not None
-            else None
-        ),
-        energielabel_na_maatregelen=(
-            pand.energielabel_na_maatregelen.value
-            if pand.energielabel_na_maatregelen is not None
-            else None
-        ),
-        oppervlakte_m2=pand.oppervlakte_m2,
-        notities=pand.notities,
-        aaa_lex_project_id=pand.aaa_lex_project_id,
-        created_at=pand.created_at,
-        updated_at=pand.updated_at,
+def _pand_or_403(db: Session, pand_id: UUID, user: User) -> Pand:
+    pand = db.get(Pand, pand_id)
+    if pand is None or pand.is_deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Pand niet gevonden"
+        )
+    if not _is_admin(user) and pand.organisation_id != user.organisation_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Geen toegang tot dit pand",
+        )
+    return pand
+
+
+def _maatregel_or_403(
+    db: Session, maatregel_id: UUID, user: User
+) -> Maatregel:
+    m = db.get(Maatregel, maatregel_id)
+    if m is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Maatregel niet gevonden",
+        )
+    _pand_or_403(db, m.pand_id, user)  # raises on access denied
+    return m
+
+
+def _quota_info(db: Session, user: User) -> QuotaInfo:
+    q = get_quota(db, user)
+    return QuotaInfo(
+        plan=q.plan,
+        limit=q.limit,
+        used=q.used,
+        remaining=q.remaining,
+        exceeded=q.exceeded,
     )
 
 
-def _maatregel_list_item(m: Maatregel) -> MaatregelListItem:
-    docs = getattr(m, "documenten", None) or []
-    return MaatregelListItem(
-        id=m.id,
-        pand_id=m.pand_id,
-        maatregel_type=m.maatregel_type.value,
-        status=m.status.value,
-        regeling_code=(
-            m.regeling_code.value if m.regeling_code is not None else None
-        ),
-        deadline_indienen=m.deadline_indienen,
-        deadline_type=(
-            m.deadline_type.value if m.deadline_type is not None else None
-        ),
-        deadline_status=(
-            m.deadline_status.value if m.deadline_status is not None else None
-        ),
-        investering_bedrag=m.investering_bedrag,
-        geschatte_subsidie=m.geschatte_subsidie,
-        toegekende_subsidie=m.toegekende_subsidie,
-        document_count=len(docs),
-        documents_uploaded=len(docs),
-        documents_verified=sum(1 for d in docs if d.geverifieerd_door_admin),
-        # documents_required wordt gevuld bij /checklist — in de
-        # lijst-context is dat te duur (N+1), dus rapporteren we 0.
-        documents_required=0,
-        created_at=m.created_at,
-    )
-
-
-def _pand_deadline_status(pand: Pand) -> Optional[str]:
-    """Neem de 'meest urgente' deadline over de maatregelen."""
-    best: Optional[DeadlineStatus] = None
-    best_priority = 0
-    for m in getattr(pand, "maatregelen", []) or []:
-        s = m.deadline_status
+def _worst_deadline_status(
+    statuses: List[Optional[DeadlineStatus]],
+) -> Optional[DeadlineStatus]:
+    ORDER = {
+        DeadlineStatus.verlopen: 4,
+        DeadlineStatus.kritiek: 3,
+        DeadlineStatus.waarschuwing: 2,
+        DeadlineStatus.ok: 1,
+    }
+    worst: Optional[DeadlineStatus] = None
+    for s in statuses:
         if s is None:
             continue
-        prio = _DEADLINE_PRIORITY.get(s, 0)
-        if prio > best_priority:
-            best = s
-            best_priority = prio
-    return best.value if best is not None else None
+        if worst is None or ORDER[s] > ORDER[worst]:
+            worst = s
+    return worst
+
+
+def _pand_to_out(pand: Pand, *, maatregelen: List[Maatregel]) -> PandOut:
+    data = PandOut.model_validate(pand)
+    data.aantal_maatregelen = len(maatregelen)
+    data.worst_deadline_status = _worst_deadline_status(
+        [m.deadline_status for m in maatregelen]
+    )
+    return data
+
+
+def _recalc_deadline(m: Maatregel) -> None:
+    """Refresh deadline_* columns from the current maatregel state."""
+    regeling = m.regeling_code
+    if regeling is None:
+        regeling = infer_regeling(m.maatregel_type)
+        # Don't persist inferred regeling yet — that's an admin decision.
+    result = calculate_deadline(
+        maatregel_type=m.maatregel_type,
+        installatie_datum=m.installatie_datum,
+        offerte_datum=m.offerte_datum,
+        regeling_code=regeling,
+    )
+    m.deadline_indienen = result.deadline_indienen
+    m.deadline_type = result.deadline_type
+    m.deadline_status = result.deadline_status
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Panden CRUD
 # ---------------------------------------------------------------------------
 
 
-@router.get(
-    "",
-    response_model=list[PandListItem],
-    summary="Lijst van panden",
-)
+@router.get("/panden", response_model=PandListResponse)
 def list_panden(
     user: VerifiedUser,
     db: DbSession,
-    deadline_status: Annotated[
-        Optional[str],
-        Query(description="Filter op dominante deadline status"),
-    ] = None,
-    klant_organisation_id: Annotated[
-        Optional[UUID],
-        Query(
-            description=(
-                "Admin-only: filter op klant-organisatie (genegeerd voor "
-                "niet-admin accounts)."
-            )
-        ),
-    ] = None,
-) -> list[PandListItem]:
-    stmt = (
-        select(Pand)
-        .where(Pand.deleted.is_(False))
-        .options(selectinload(Pand.maatregelen))
-        .order_by(Pand.created_at.desc())
-    )
-
-    if not is_admin(user):
+    deadline_status: Optional[DeadlineStatus] = Query(default=None),
+    organisation_id: Optional[UUID] = Query(default=None),
+) -> PandListResponse:
+    """Panden van de ingelogde gebruiker. Admin ziet alles."""
+    stmt = select(Pand).where(Pand.is_deleted.is_(False))
+    if not _is_admin(user):
         if user.organisation_id is None:
-            return []
-        stmt = stmt.where(Pand.organisation_id == user.organisation_id)
-    elif klant_organisation_id is not None:
-        stmt = stmt.where(Pand.organisation_id == klant_organisation_id)
-
-    items: list[PandListItem] = []
-    for pand in db.execute(stmt).scalars().all():
-        status_value = _pand_deadline_status(pand)
-        if deadline_status and status_value != deadline_status:
-            continue
-        items.append(
-            PandListItem(
-                id=pand.id,
-                straat=pand.straat,
-                huisnummer=pand.huisnummer,
-                postcode=pand.postcode,
-                plaats=pand.plaats,
-                bouwjaar=pand.bouwjaar,
-                pand_type=pand.pand_type.value,
-                eigenaar_type=pand.eigenaar_type.value,
-                energielabel_huidig=(
-                    pand.energielabel_huidig.value
-                    if pand.energielabel_huidig is not None
-                    else None
-                ),
-                maatregelen_count=len(pand.maatregelen),
-                deadline_status=status_value,
-                created_at=pand.created_at,
+            return PandListResponse(
+                items=[], totaal=0, quota=_quota_info(db, user)
             )
-        )
-    return items
+        stmt = stmt.where(Pand.organisation_id == user.organisation_id)
+    else:
+        if organisation_id is not None:
+            stmt = stmt.where(Pand.organisation_id == organisation_id)
+
+    stmt = stmt.order_by(Pand.created_at.desc())
+    panden = list(db.execute(stmt).scalars().all())
+
+    # Bulk-load maatregelen zodat we geen N+1 hebben op het overzicht.
+    pand_ids = [p.id for p in panden]
+    maatregelen_per_pand: dict[UUID, List[Maatregel]] = {pid: [] for pid in pand_ids}
+    if pand_ids:
+        rows = db.execute(
+            select(Maatregel).where(Maatregel.pand_id.in_(pand_ids))
+        ).scalars().all()
+        for m in rows:
+            maatregelen_per_pand[m.pand_id].append(m)
+
+    items = [
+        _pand_to_out(p, maatregelen=maatregelen_per_pand.get(p.id, []))
+        for p in panden
+    ]
+    if deadline_status is not None:
+        items = [i for i in items if i.worst_deadline_status == deadline_status]
+
+    return PandListResponse(
+        items=items, totaal=len(items), quota=_quota_info(db, user)
+    )
 
 
 @router.post(
-    "",
+    "/panden",
     response_model=PandOut,
     status_code=status.HTTP_201_CREATED,
-    summary="Maak een nieuw pand aan",
 )
 def create_pand(
     payload: PandCreate,
     user: VerifiedUser,
     db: DbSession,
 ) -> PandOut:
-    # Klant-accounts moeten aan een organisatie gekoppeld zijn.
-    if user.organisation_id is None and not is_admin(user):
+    if user.organisation_id is None and not _is_admin(user):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Uw account is niet gekoppeld aan een organisatie",
+            detail="Account zonder organisatie kan geen panden aanmaken",
         )
 
-    enforce_pand_limit(db, user)
+    # Plan-limit enforcement — admins slaan we over (zie get_quota).
+    quota = get_quota(db, user)
+    if quota.exceeded:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "PLAN_LIMIT_REACHED",
+                "plan": quota.plan,
+                "limit": quota.limit,
+                "used": quota.used,
+                "message": (
+                    f"Uw huidige plan ({quota.plan}) staat {quota.limit} "
+                    f"panden toe. Upgrade voor meer panden."
+                ),
+            },
+        )
 
     pand = Pand(
-        organisation_id=user.organisation_id,
+        organisation_id=user.organisation_id,  # type: ignore[arg-type]
         created_by=user.id,
         straat=payload.straat.strip(),
         huisnummer=payload.huisnummer.strip(),
-        postcode=payload.postcode.strip().upper(),
+        postcode=payload.postcode.strip(),
         plaats=payload.plaats.strip(),
         bouwjaar=payload.bouwjaar,
-        pand_type=PandType(payload.pand_type),
-        eigenaar_type=EigenaarType(payload.eigenaar_type),
-        oppervlakte_m2=payload.oppervlakte_m2,
-        notities=payload.notities,
+        pand_type=payload.pand_type,
+        eigenaar_type=payload.eigenaar_type,
     )
     db.add(pand)
     db.commit()
     db.refresh(pand)
-    return _pand_out(pand)
+    return _pand_to_out(pand, maatregelen=[])
 
 
-@router.get(
-    "/{pand_id}",
-    response_model=PandDetail,
-    summary="Pand detail inclusief maatregelen",
-)
+@router.get("/panden/{pand_id}", response_model=PandDetailResponse)
 def get_pand(
-    pand_id: UUID,
-    user: VerifiedUser,
-    db: DbSession,
-) -> PandDetail:
-    pand = db.execute(
-        select(Pand)
-        .where(Pand.id == pand_id)
-        .options(selectinload(Pand.maatregelen).selectinload(Maatregel.documenten))
-    ).scalar_one_or_none()
-    if pand is None or pand.deleted:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Pand niet gevonden"
+    pand_id: UUID, user: VerifiedUser, db: DbSession
+) -> PandDetailResponse:
+    pand = _pand_or_403(db, pand_id, user)
+    maatregelen = list(
+        db.execute(
+            select(Maatregel)
+            .where(Maatregel.pand_id == pand_id)
+            .order_by(Maatregel.created_at.desc())
         )
-    if not can_access_pand(pand, user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Geen toegang tot dit pand",
-        )
-
-    base = _pand_out(pand)
-    maatregelen = [
-        _maatregel_list_item(m)
-        for m in sorted(
-            pand.maatregelen, key=lambda x: x.created_at, reverse=True
-        )
-    ]
-    return PandDetail(**base.model_dump(), maatregelen=maatregelen)
+        .scalars()
+        .all()
+    )
+    base = _pand_to_out(pand, maatregelen=maatregelen).model_dump()
+    base["maatregelen"] = [MaatregelShort.model_validate(m) for m in maatregelen]
+    return PandDetailResponse.model_validate(base)
 
 
-@router.put(
-    "/{pand_id}",
-    response_model=PandOut,
-    summary="Bewerk een pand",
-)
+@router.put("/panden/{pand_id}", response_model=PandOut)
 def update_pand(
     pand_id: UUID,
     payload: PandUpdate,
     user: VerifiedUser,
     db: DbSession,
 ) -> PandOut:
-    pand = get_pand_or_404(db, pand_id, user)
-    data = payload.model_dump(exclude_unset=True)
+    pand = _pand_or_403(db, pand_id, user)
 
-    # Klant mag AAA-Lex opname-velden niet wijzigen.
-    admin_only_fields = {
+    # Klant mag alleen pandgegevens aanpassen; AAA-Lex-velden blijven
+    # read-only tot een admin ze invult.
+    klant_fields = {
+        "straat",
+        "huisnummer",
+        "postcode",
+        "plaats",
+        "bouwjaar",
+        "pand_type",
+        "eigenaar_type",
+    }
+    admin_fields = {
         "energielabel_huidig",
         "energielabel_na_maatregelen",
+        "oppervlakte_m2",
+        "notities",
+        "aaa_lex_project_id",
     }
-    if not is_admin(user):
-        for field in admin_only_fields:
-            if field in data:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=(
-                        f"Veld '{field}' kan alleen door AAA-Lex worden ingevuld"
-                    ),
-                )
 
-    if "straat" in data and data["straat"] is not None:
-        pand.straat = data["straat"].strip()
-    if "huisnummer" in data and data["huisnummer"] is not None:
-        pand.huisnummer = data["huisnummer"].strip()
-    if "postcode" in data and data["postcode"] is not None:
-        pand.postcode = data["postcode"].strip().upper()
-    if "plaats" in data and data["plaats"] is not None:
-        pand.plaats = data["plaats"].strip()
-    if "bouwjaar" in data and data["bouwjaar"] is not None:
-        pand.bouwjaar = data["bouwjaar"]
-    if "pand_type" in data and data["pand_type"] is not None:
-        pand.pand_type = PandType(data["pand_type"])
-    if "eigenaar_type" in data and data["eigenaar_type"] is not None:
-        pand.eigenaar_type = EigenaarType(data["eigenaar_type"])
-    if "oppervlakte_m2" in data:
-        pand.oppervlakte_m2 = data["oppervlakte_m2"]
-    if "notities" in data:
-        pand.notities = data["notities"]
-    if "energielabel_huidig" in data:
-        pand.energielabel_huidig = (
-            Energielabel(data["energielabel_huidig"])
-            if data["energielabel_huidig"] is not None
-            else None
-        )
-    if "energielabel_na_maatregelen" in data:
-        pand.energielabel_na_maatregelen = (
-            Energielabel(data["energielabel_na_maatregelen"])
-            if data["energielabel_na_maatregelen"] is not None
-            else None
-        )
+    data = payload.model_dump(exclude_unset=True)
+    for field in klant_fields & data.keys():
+        value = data[field]
+        if isinstance(value, str):
+            value = value.strip()
+        setattr(pand, field, value)
+    if _is_admin(user):
+        for field in admin_fields & data.keys():
+            setattr(pand, field, data[field])
 
     db.commit()
     db.refresh(pand)
-    return _pand_out(pand)
+
+    # Aantal maatregelen herberekenen zodat _pand_to_out klopt.
+    maatregelen = list(
+        db.execute(select(Maatregel).where(Maatregel.pand_id == pand.id))
+        .scalars()
+        .all()
+    )
+    return _pand_to_out(pand, maatregelen=maatregelen)
 
 
 @router.delete(
-    "/{pand_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    summary="Soft-delete een pand",
+    "/panden/{pand_id}", status_code=status.HTTP_204_NO_CONTENT
 )
 def delete_pand(
+    pand_id: UUID, user: VerifiedUser, db: DbSession
+) -> Response:
+    pand = _pand_or_403(db, pand_id, user)
+    pand.is_deleted = True
+    pand.deleted_at = datetime.now(timezone.utc)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# Maatregelen
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/panden/{pand_id}/maatregelen",
+    response_model=List[MaatregelOut],
+)
+def list_maatregelen(
+    pand_id: UUID, user: VerifiedUser, db: DbSession
+) -> List[MaatregelOut]:
+    _pand_or_403(db, pand_id, user)
+    rows = (
+        db.execute(
+            select(Maatregel)
+            .where(Maatregel.pand_id == pand_id)
+            .order_by(Maatregel.created_at.desc())
+        )
+        .scalars()
+        .all()
+    )
+    return [MaatregelOut.model_validate(m) for m in rows]
+
+
+@router.post(
+    "/panden/{pand_id}/maatregelen",
+    response_model=MaatregelOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_maatregel(
     pand_id: UUID,
+    payload: MaatregelCreate,
+    user: VerifiedUser,
+    db: DbSession,
+) -> MaatregelOut:
+    pand = _pand_or_403(db, pand_id, user)
+
+    if payload.maatregel_type is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="maatregel_type is verplicht",
+        )
+
+    m = Maatregel(
+        pand_id=pand.id,
+        created_by=user.id,
+        maatregel_type=payload.maatregel_type,
+        omschrijving=payload.omschrijving,
+        status=payload.status or MaatregelStatus.orientatie,
+        apparaat_merk=payload.apparaat_merk,
+        apparaat_typenummer=payload.apparaat_typenummer,
+        apparaat_meldcode=payload.apparaat_meldcode,
+        installateur_naam=payload.installateur_naam,
+        installateur_kvk=payload.installateur_kvk,
+        installateur_gecertificeerd=bool(payload.installateur_gecertificeerd),
+        installatie_datum=payload.installatie_datum,
+        offerte_datum=payload.offerte_datum,
+        investering_bedrag=payload.investering_bedrag,
+        geschatte_subsidie=payload.geschatte_subsidie,
+        regeling_code=payload.regeling_code or infer_regeling(payload.maatregel_type),
+    )
+    _recalc_deadline(m)
+    db.add(m)
+    db.commit()
+    db.refresh(m)
+    return MaatregelOut.model_validate(m)
+
+
+@router.get(
+    "/maatregelen/{maatregel_id}",
+    response_model=MaatregelOut,
+)
+def get_maatregel(
+    maatregel_id: UUID, user: VerifiedUser, db: DbSession
+) -> MaatregelOut:
+    m = _maatregel_or_403(db, maatregel_id, user)
+    return MaatregelOut.model_validate(m)
+
+
+@router.put(
+    "/maatregelen/{maatregel_id}",
+    response_model=MaatregelOut,
+)
+def update_maatregel(
+    maatregel_id: UUID,
+    payload: MaatregelUpdate,
+    user: VerifiedUser,
+    db: DbSession,
+) -> MaatregelOut:
+    m = _maatregel_or_403(db, maatregel_id, user)
+
+    data = payload.model_dump(exclude_unset=True)
+    # toegekende_subsidie is AAA-Lex only.
+    if "toegekende_subsidie" in data and not _is_admin(user):
+        data.pop("toegekende_subsidie")
+
+    for field, value in data.items():
+        setattr(m, field, value)
+
+    _recalc_deadline(m)
+    db.commit()
+    db.refresh(m)
+    return MaatregelOut.model_validate(m)
+
+
+@router.delete(
+    "/maatregelen/{maatregel_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_maatregel(
+    maatregel_id: UUID, user: VerifiedUser, db: DbSession
+) -> Response:
+    m = _maatregel_or_403(db, maatregel_id, user)
+    db.delete(m)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# Checklist + documenten
+# ---------------------------------------------------------------------------
+
+
+def _build_checklist(
+    m: Maatregel, docs: List[MaatregelDocument]
+) -> ChecklistResponse:
+    checklist = get_required_documents(m.maatregel_type)
+
+    # Group uploaded docs per type. We accept multiple uploads per type
+    # (bijv. meerdere werkzaamheden-fotos) and beschouwen het type als
+    # "geüpload" zodra er minimaal één staat.
+    docs_per_type: dict[MaatregelDocumentType, List[MaatregelDocument]] = {}
+    for d in docs:
+        docs_per_type.setdefault(d.document_type, []).append(d)
+
+    items: List[ChecklistItemOut] = []
+    for c in checklist:
+        uploaded = docs_per_type.get(c.document_type, [])
+        verified = any(d.geverifieerd_door_admin for d in uploaded)
+        items.append(
+            ChecklistItemOut(
+                document_type=c.document_type,
+                label=c.label,
+                uitleg=c.uitleg,
+                verplicht=c.verplicht,
+                geupload=bool(uploaded),
+                geverifieerd=verified,
+                document_id=uploaded[0].id if uploaded else None,
+            )
+        )
+
+    verplicht = [c for c in checklist if c.verplicht]
+    verplicht_geupload = sum(1 for c in verplicht if docs_per_type.get(c.document_type))
+    verplicht_geverifieerd = sum(
+        1
+        for c in verplicht
+        if any(
+            d.geverifieerd_door_admin for d in docs_per_type.get(c.document_type, [])
+        )
+    )
+    return ChecklistResponse(
+        maatregel_id=m.id,
+        items=items,
+        verplicht_totaal=len(verplicht),
+        verplicht_geupload=verplicht_geupload,
+        verplicht_geverifieerd=verplicht_geverifieerd,
+        compleet=verplicht_geupload == len(verplicht),
+    )
+
+
+@router.get(
+    "/maatregelen/{maatregel_id}/checklist",
+    response_model=ChecklistResponse,
+)
+def get_checklist(
+    maatregel_id: UUID, user: VerifiedUser, db: DbSession
+) -> ChecklistResponse:
+    m = _maatregel_or_403(db, maatregel_id, user)
+    docs = list(
+        db.execute(
+            select(MaatregelDocument).where(
+                MaatregelDocument.maatregel_id == m.id
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return _build_checklist(m, docs)
+
+
+@router.get(
+    "/maatregelen/{maatregel_id}/documenten",
+    response_model=List[DocumentOut],
+)
+def list_documenten(
+    maatregel_id: UUID, user: VerifiedUser, db: DbSession
+) -> List[DocumentOut]:
+    m = _maatregel_or_403(db, maatregel_id, user)
+    rows = list(
+        db.execute(
+            select(MaatregelDocument)
+            .where(MaatregelDocument.maatregel_id == m.id)
+            .order_by(MaatregelDocument.created_at.desc())
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        DocumentOut(
+            **{
+                **DocumentOut.model_validate(d).model_dump(),
+                "pending_upload": d.r2_key.startswith("pending://"),
+            }
+        )
+        for d in rows
+    ]
+
+
+@router.post(
+    "/maatregelen/{maatregel_id}/documenten",
+    response_model=UploadUrlResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_document(
+    maatregel_id: UUID,
+    payload: UploadUrlRequest,
+    user: VerifiedUser,
+    db: DbSession,
+) -> UploadUrlResponse:
+    """Reserveer een presigned R2-URL voor een nieuw document.
+
+    Het document record wordt direct aangemaakt met een ``pending://``
+    r2_key; de client bevestigt de upload via de confirm-endpoint
+    hieronder.
+    """
+    m = _maatregel_or_403(db, maatregel_id, user)
+
+    allowed = allowed_document_types(m.maatregel_type)
+    if payload.document_type not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Documenttype '{payload.document_type.value}' is niet "
+                f"geldig voor maatregel {m.maatregel_type.value}"
+            ),
+        )
+
+    pand = db.get(Pand, m.pand_id)
+    assert pand is not None
+    document_id = uuid4()
+    object_key = (
+        f"{pand.organisation_id}/panden/{pand.id}/maatregelen/{m.id}/"
+        f"{document_id}/{r2_storage.safe_filename(payload.bestandsnaam)}"
+    )
+
+    upload_url = r2_storage.generate_upload_url(
+        object_key, content_type=payload.content_type, expires_in=3600
+    )
+
+    doc = MaatregelDocument(
+        id=document_id,
+        maatregel_id=m.id,
+        document_type=payload.document_type,
+        bestandsnaam=r2_storage.safe_filename(payload.bestandsnaam),
+        r2_key=r2_storage.make_pending_url(object_key),
+        geupload_door=user.id,
+    )
+    db.add(doc)
+    db.commit()
+
+    return UploadUrlResponse(
+        upload_url=upload_url,
+        document_id=document_id,
+        r2_key=object_key,
+        expires_in=3600,
+    )
+
+
+@router.post(
+    "/maatregelen/{maatregel_id}/documenten/{document_id}/confirm",
+    response_model=DocumentOut,
+)
+def confirm_document(
+    maatregel_id: UUID,
+    document_id: UUID,
+    user: VerifiedUser,
+    db: DbSession,
+) -> DocumentOut:
+    _maatregel_or_403(db, maatregel_id, user)
+    doc = db.get(MaatregelDocument, document_id)
+    if doc is None or doc.maatregel_id != maatregel_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document niet gevonden",
+        )
+    object_key = r2_storage.object_key_from_storage_url(doc.r2_key)
+    doc.r2_key = r2_storage.make_committed_url(object_key)
+    db.commit()
+    db.refresh(doc)
+    out = DocumentOut.model_validate(doc).model_dump()
+    out["pending_upload"] = doc.r2_key.startswith("pending://")
+    return DocumentOut(**out)
+
+
+@router.post(
+    "/maatregelen/{maatregel_id}/documenten/{document_id}/verify",
+    response_model=DocumentOut,
+)
+def verify_document(
+    maatregel_id: UUID,
+    document_id: UUID,
+    user: VerifiedUser,
+    db: DbSession,
+) -> DocumentOut:
+    """Admin-only: vink document af als geverifieerd."""
+    if not _is_admin(user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Alleen admins kunnen documenten verifiëren",
+        )
+    _maatregel_or_403(db, maatregel_id, user)
+    doc = db.get(MaatregelDocument, document_id)
+    if doc is None or doc.maatregel_id != maatregel_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document niet gevonden",
+        )
+    doc.geverifieerd_door_admin = True
+    db.commit()
+    db.refresh(doc)
+    out = DocumentOut.model_validate(doc).model_dump()
+    out["pending_upload"] = doc.r2_key.startswith("pending://")
+    return DocumentOut(**out)
+
+
+@router.delete(
+    "/maatregelen/{maatregel_id}/documenten/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_document(
+    maatregel_id: UUID,
+    document_id: UUID,
     user: VerifiedUser,
     db: DbSession,
 ) -> Response:
-    pand = get_pand_or_404(db, pand_id, user)
-    pand.deleted = True
+    _maatregel_or_403(db, maatregel_id, user)
+    doc = db.get(MaatregelDocument, document_id)
+    if doc is None or doc.maatregel_id != maatregel_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document niet gevonden",
+        )
+    if doc.geverifieerd_door_admin and not _is_admin(user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Geverifieerde documenten kunnen niet meer worden verwijderd",
+        )
+    object_key = r2_storage.object_key_from_storage_url(doc.r2_key)
+    r2_storage.delete_object(object_key)
+    db.delete(doc)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/maatregelen/{maatregel_id}/documenten/{document_id}/download-url",
+)
+def download_document(
+    maatregel_id: UUID,
+    document_id: UUID,
+    user: VerifiedUser,
+    db: DbSession,
+) -> dict[str, object]:
+    _maatregel_or_403(db, maatregel_id, user)
+    doc = db.get(MaatregelDocument, document_id)
+    if doc is None or doc.maatregel_id != maatregel_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document niet gevonden",
+        )
+    if doc.r2_key.startswith("pending://"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Document upload nog niet bevestigd",
+        )
+    key = r2_storage.object_key_from_storage_url(doc.r2_key)
+    url = r2_storage.generate_download_url(
+        key, expires_in=900, download_filename=doc.bestandsnaam
+    )
+    return {"download_url": url, "expires_in": 900}
+
+
+# ---------------------------------------------------------------------------
+# Admin widgets
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/admin/panden/kritieke-deadlines",
+    response_model=List[MaatregelOut],
+)
+def kritieke_deadlines(
+    user: VerifiedUser,
+    db: DbSession,
+    max_dagen: int = Query(default=30, ge=0, le=365),
+) -> List[MaatregelOut]:
+    """Admin-widget: maatregelen met deadline binnen ``max_dagen`` dagen.
+
+    Niet-admins krijgen 403 zodat deze widget alleen op het admin-
+    dashboard zichtbaar is.
+    """
+    if not _is_admin(user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Alleen admins",
+        )
+    today = func.current_date()
+    rows = (
+        db.execute(
+            select(Maatregel)
+            .where(Maatregel.deadline_indienen.is_not(None))
+            .where(
+                Maatregel.deadline_status.in_(
+                    [DeadlineStatus.kritiek, DeadlineStatus.waarschuwing, DeadlineStatus.verlopen]
+                )
+            )
+            .order_by(Maatregel.deadline_indienen.asc())
+        )
+        .scalars()
+        .all()
+    )
+    # In-python filter op max_dagen om ook ``verlopen`` rijen mee te nemen
+    # (die hebben een negatieve delta maar blijven relevant op het dashboard).
+    result: List[MaatregelOut] = []
+    from datetime import date as _date
+
+    today_py = _date.today()
+    for m in rows:
+        if m.deadline_indienen is None:
+            continue
+        delta = (m.deadline_indienen - today_py).days
+        if delta <= max_dagen:
+            result.append(MaatregelOut.model_validate(m))
+    return result

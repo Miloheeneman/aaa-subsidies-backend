@@ -1,12 +1,23 @@
-"""Pydantic schemas voor de panden-module."""
-
+"""Pydantic schemas for the panden module (STAP 9)."""
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import List, Literal, Optional
+from typing import List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from app.models.enums import (
+    DeadlineStatus,
+    DeadlineTiming,
+    EigenaarType,
+    EnergielabelKlasse,
+    MaatregelDocumentType,
+    MaatregelStatus,
+    MaatregelType,
+    PandType,
+    RegelingCode,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -17,88 +28,47 @@ from pydantic import BaseModel, ConfigDict, Field
 class PandBase(BaseModel):
     straat: str = Field(min_length=1, max_length=255)
     huisnummer: str = Field(min_length=1, max_length=32)
-    postcode: str = Field(min_length=1, max_length=16)
+    postcode: str = Field(min_length=4, max_length=16)
     plaats: str = Field(min_length=1, max_length=128)
     bouwjaar: int = Field(ge=1500, le=2100)
-    pand_type: Literal[
-        "woning",
-        "appartement",
-        "kantoor",
-        "bedrijfspand",
-        "zorginstelling",
-        "school",
-        "sportaccommodatie",
-        "overig",
-    ]
-    eigenaar_type: Literal[
-        "eigenaar_bewoner",
-        "particulier_verhuurder",
-        "zakelijk_verhuurder",
-        "vve",
-        "overig",
-    ]
+    pand_type: PandType
+    eigenaar_type: EigenaarType
 
 
 class PandCreate(PandBase):
-    # Klanten kunnen deze optioneel meegeven; admin vult ze later bij.
-    oppervlakte_m2: Optional[float] = Field(default=None, ge=0)
-    notities: Optional[str] = None
+    pass
 
 
 class PandUpdate(BaseModel):
+    """All fields optional; only the fields you send get overwritten."""
+
     straat: Optional[str] = Field(default=None, min_length=1, max_length=255)
     huisnummer: Optional[str] = Field(default=None, min_length=1, max_length=32)
-    postcode: Optional[str] = Field(default=None, min_length=1, max_length=16)
+    postcode: Optional[str] = Field(default=None, min_length=4, max_length=16)
     plaats: Optional[str] = Field(default=None, min_length=1, max_length=128)
     bouwjaar: Optional[int] = Field(default=None, ge=1500, le=2100)
-    pand_type: Optional[
-        Literal[
-            "woning",
-            "appartement",
-            "kantoor",
-            "bedrijfspand",
-            "zorginstelling",
-            "school",
-            "sportaccommodatie",
-            "overig",
-        ]
-    ] = None
-    eigenaar_type: Optional[
-        Literal[
-            "eigenaar_bewoner",
-            "particulier_verhuurder",
-            "zakelijk_verhuurder",
-            "vve",
-            "overig",
-        ]
-    ] = None
-    # AAA-Lex opname-velden (admin-only via API dispatcher).
-    energielabel_huidig: Optional[
-        Literal["A", "B", "C", "D", "E", "F", "G"]
-    ] = None
-    energielabel_na_maatregelen: Optional[
-        Literal["A", "B", "C", "D", "E", "F", "G"]
-    ] = None
+    pand_type: Optional[PandType] = None
+    eigenaar_type: Optional[EigenaarType] = None
+
+    # AAA-Lex-only velden — worden door het backend stilletjes genegeerd
+    # voor niet-admins (zie routes/panden.py).
+    energielabel_huidig: Optional[EnergielabelKlasse] = None
+    energielabel_na_maatregelen: Optional[EnergielabelKlasse] = None
     oppervlakte_m2: Optional[float] = Field(default=None, ge=0)
     notities: Optional[str] = None
+    aaa_lex_project_id: Optional[UUID] = None
 
 
-class PandListItem(BaseModel):
+class MaatregelShort(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
-    straat: str
-    huisnummer: str
-    postcode: str
-    plaats: str
-    bouwjaar: int
-    pand_type: str
-    eigenaar_type: str
-    energielabel_huidig: Optional[str] = None
-    maatregelen_count: int = 0
-    # Samenvatting van deadlines op maatregel-niveau ("kritiek" dominante).
-    deadline_status: Optional[str] = None
-    created_at: datetime
+    maatregel_type: MaatregelType
+    status: MaatregelStatus
+    regeling_code: Optional[RegelingCode] = None
+    geschatte_subsidie: Optional[float] = None
+    deadline_indienen: Optional[date] = None
+    deadline_status: Optional[DeadlineStatus] = None
 
 
 class PandOut(BaseModel):
@@ -106,22 +76,38 @@ class PandOut(BaseModel):
 
     id: UUID
     organisation_id: UUID
-    organisation_name: Optional[str] = None
     created_by: UUID
+
     straat: str
     huisnummer: str
     postcode: str
     plaats: str
     bouwjaar: int
-    pand_type: str
-    eigenaar_type: str
-    energielabel_huidig: Optional[str] = None
-    energielabel_na_maatregelen: Optional[str] = None
+    pand_type: PandType
+    eigenaar_type: EigenaarType
+
+    energielabel_huidig: Optional[EnergielabelKlasse] = None
+    energielabel_na_maatregelen: Optional[EnergielabelKlasse] = None
     oppervlakte_m2: Optional[float] = None
     notities: Optional[str] = None
     aaa_lex_project_id: Optional[UUID] = None
+
     created_at: datetime
     updated_at: datetime
+
+    # Afgeleid, ingevuld door de route
+    aantal_maatregelen: int = 0
+    worst_deadline_status: Optional[DeadlineStatus] = None
+
+
+class PandListResponse(BaseModel):
+    items: List[PandOut]
+    totaal: int
+    quota: "QuotaInfo"
+
+
+class PandDetailResponse(PandOut):
+    maatregelen: List[MaatregelShort] = []
 
 
 # ---------------------------------------------------------------------------
@@ -129,59 +115,14 @@ class PandOut(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-MAATREGEL_TYPES = [
-    "warmtepomp_lucht_water",
-    "warmtepomp_water_water",
-    "warmtepomp_hybride",
-    "dakisolatie",
-    "gevelisolatie",
-    "vloerisolatie",
-    "hr_glas",
-    "zonneboiler",
-    "eia_investering",
-    "mia_vamil_investering",
-    "dumava_maatregel",
-]
-MAATREGEL_STATUSES = [
-    "orientatie",
-    "gepland",
-    "uitgevoerd",
-    "aangevraagd",
-    "goedgekeurd",
-    "afgewezen",
-]
-REGELING_CODES = ["ISDE", "EIA", "MIA", "VAMIL", "DUMAVA"]
-
-
 class MaatregelCreate(BaseModel):
-    maatregel_type: Literal[
-        "warmtepomp_lucht_water",
-        "warmtepomp_water_water",
-        "warmtepomp_hybride",
-        "dakisolatie",
-        "gevelisolatie",
-        "vloerisolatie",
-        "hr_glas",
-        "zonneboiler",
-        "eia_investering",
-        "mia_vamil_investering",
-        "dumava_maatregel",
-    ]
+    maatregel_type: MaatregelType
     omschrijving: Optional[str] = None
-    status: Optional[
-        Literal[
-            "orientatie",
-            "gepland",
-            "uitgevoerd",
-            "aangevraagd",
-            "goedgekeurd",
-            "afgewezen",
-        ]
-    ] = None
+    status: Optional[MaatregelStatus] = None
 
     apparaat_merk: Optional[str] = Field(default=None, max_length=128)
     apparaat_typenummer: Optional[str] = Field(default=None, max_length=128)
-    apparaat_meldcode: Optional[str] = Field(default=None, max_length=64)
+    apparaat_meldcode: Optional[str] = Field(default=None, max_length=128)
     installateur_naam: Optional[str] = Field(default=None, max_length=255)
     installateur_kvk: Optional[str] = Field(default=None, max_length=32)
     installateur_gecertificeerd: Optional[bool] = None
@@ -189,53 +130,13 @@ class MaatregelCreate(BaseModel):
     offerte_datum: Optional[date] = None
 
     investering_bedrag: Optional[float] = Field(default=None, ge=0)
-    regeling_code: Optional[Literal["ISDE", "EIA", "MIA", "VAMIL", "DUMAVA"]] = None
+    geschatte_subsidie: Optional[float] = Field(default=None, ge=0)
+    regeling_code: Optional[RegelingCode] = None
 
 
-class MaatregelUpdate(BaseModel):
-    omschrijving: Optional[str] = None
-    status: Optional[
-        Literal[
-            "orientatie",
-            "gepland",
-            "uitgevoerd",
-            "aangevraagd",
-            "goedgekeurd",
-            "afgewezen",
-        ]
-    ] = None
-    apparaat_merk: Optional[str] = Field(default=None, max_length=128)
-    apparaat_typenummer: Optional[str] = Field(default=None, max_length=128)
-    apparaat_meldcode: Optional[str] = Field(default=None, max_length=64)
-    installateur_naam: Optional[str] = Field(default=None, max_length=255)
-    installateur_kvk: Optional[str] = Field(default=None, max_length=32)
-    installateur_gecertificeerd: Optional[bool] = None
-    installatie_datum: Optional[date] = None
-    offerte_datum: Optional[date] = None
-    investering_bedrag: Optional[float] = Field(default=None, ge=0)
+class MaatregelUpdate(MaatregelCreate):
+    maatregel_type: Optional[MaatregelType] = None  # type: ignore[assignment]
     toegekende_subsidie: Optional[float] = Field(default=None, ge=0)
-    regeling_code: Optional[Literal["ISDE", "EIA", "MIA", "VAMIL", "DUMAVA"]] = None
-
-
-class MaatregelListItem(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: UUID
-    pand_id: UUID
-    maatregel_type: str
-    status: str
-    regeling_code: Optional[str] = None
-    deadline_indienen: Optional[date] = None
-    deadline_type: Optional[str] = None
-    deadline_status: Optional[str] = None
-    investering_bedrag: Optional[float] = None
-    geschatte_subsidie: Optional[float] = None
-    toegekende_subsidie: Optional[float] = None
-    document_count: int = 0
-    documents_required: int = 0
-    documents_uploaded: int = 0
-    documents_verified: int = 0
-    created_at: datetime
 
 
 class MaatregelOut(BaseModel):
@@ -244,63 +145,55 @@ class MaatregelOut(BaseModel):
     id: UUID
     pand_id: UUID
     created_by: UUID
-    maatregel_type: str
+
+    maatregel_type: MaatregelType
     omschrijving: Optional[str] = None
-    status: str
-    regeling_code: Optional[str] = None
+    status: MaatregelStatus
 
     apparaat_merk: Optional[str] = None
     apparaat_typenummer: Optional[str] = None
     apparaat_meldcode: Optional[str] = None
     installateur_naam: Optional[str] = None
     installateur_kvk: Optional[str] = None
-    installateur_gecertificeerd: bool = False
+    installateur_gecertificeerd: bool
     installatie_datum: Optional[date] = None
     offerte_datum: Optional[date] = None
 
     investering_bedrag: Optional[float] = None
     geschatte_subsidie: Optional[float] = None
     toegekende_subsidie: Optional[float] = None
+    regeling_code: Optional[RegelingCode] = None
 
     deadline_indienen: Optional[date] = None
-    deadline_type: Optional[str] = None
-    deadline_status: Optional[str] = None
+    deadline_type: Optional[DeadlineTiming] = None
+    deadline_status: Optional[DeadlineStatus] = None
 
     created_at: datetime
     updated_at: datetime
 
 
-class PandDetail(PandOut):
-    maatregelen: List[MaatregelListItem] = []
-
-
 # ---------------------------------------------------------------------------
-# Documenten
+# Checklist + documenten
 # ---------------------------------------------------------------------------
 
 
-class DocumentUploadRequest(BaseModel):
-    document_type: Literal[
-        "factuur",
-        "betaalbewijs",
-        "meldcode_bewijs",
-        "foto_werkzaamheden",
-        "inbedrijfstelling",
-        "offerte",
-        "kvk_uittreksel",
-        "machtiging",
-        "overig",
-    ]
-    filename: str = Field(min_length=1, max_length=512)
-    content_type: str = Field(default="application/octet-stream", max_length=128)
+class ChecklistItemOut(BaseModel):
+    document_type: MaatregelDocumentType
+    label: str
+    uitleg: str
+    verplicht: bool
+    geupload: bool
+    geverifieerd: bool
+    document_id: Optional[UUID] = None
 
 
-class DocumentUploadResponse(BaseModel):
-    upload_url: str
-    document_id: UUID
-    expires_in: int
-    r2_key: str
-    content_type: str
+class ChecklistResponse(BaseModel):
+    maatregel_id: UUID
+    items: List[ChecklistItemOut]
+    verplicht_totaal: int
+    verplicht_geupload: int
+    verplicht_geverifieerd: int
+    compleet: bool  # alle verplichte docs geüpload (niet per se geverifieerd)
 
 
 class DocumentOut(BaseModel):
@@ -308,36 +201,40 @@ class DocumentOut(BaseModel):
 
     id: UUID
     maatregel_id: UUID
-    document_type: str
+    document_type: MaatregelDocumentType
     bestandsnaam: str
     r2_key: str
     geupload_door: UUID
     geverifieerd_door_admin: bool
+    notities: Optional[str] = None
     created_at: datetime
+    pending_upload: bool = False
 
 
-class ChecklistItem(BaseModel):
-    document_type: str
-    label: str
-    uitleg: Optional[str] = None
-    verplicht: bool
-    geupload: bool
-    geverifieerd: bool
-    document_id: Optional[UUID] = None
-    bestandsnaam: Optional[str] = None
+class UploadUrlRequest(BaseModel):
+    document_type: MaatregelDocumentType
+    bestandsnaam: str = Field(min_length=1, max_length=512)
+    content_type: str = Field(default="application/octet-stream", max_length=128)
 
 
-class ChecklistResponse(BaseModel):
-    maatregel_id: UUID
-    items: List[ChecklistItem]
-    required_count: int
-    uploaded_required_count: int
-    missing_count: int
-    compleet: bool
+class UploadUrlResponse(BaseModel):
+    upload_url: str
+    document_id: UUID
+    r2_key: str
+    expires_in: int
 
 
-class PlanLimitError(BaseModel):
-    detail: str
+# ---------------------------------------------------------------------------
+# Quota
+# ---------------------------------------------------------------------------
+
+
+class QuotaInfo(BaseModel):
     plan: str
-    limit: int
-    current: int
+    limit: Optional[int] = None  # None = unlimited (admin/enterprise)
+    used: int = 0
+    remaining: Optional[int] = None
+    exceeded: bool = False
+
+
+PandListResponse.model_rebuild()

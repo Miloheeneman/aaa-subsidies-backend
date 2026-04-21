@@ -1,13 +1,13 @@
 from app.models.enums import (
     AanvraagStatus,
     DeadlineStatus,
+    DeadlineTiming,
     DeadlineType,
     DocumentType,
     EigenaarType,
-    Energielabel,
+    EnergielabelKlasse,
     LeadStatus,
-    Maatregel as LegacyMaatregel,
-    MaatregelDeadlineType,
+    Maatregel as MaatregelEnum,
     MaatregelDocumentType,
     MaatregelStatus,
     MaatregelType,
@@ -25,35 +25,35 @@ from app.models.installateur_lead import InstallateurLead
 from app.models.regelingen_config import RegelingConfig
 from app.models.aaa_lex_project import AAALexProject
 from app.models.pand import Pand
-from app.models.pand_maatregel import Maatregel
-from app.models.pand_maatregel_document import MaatregelDocument
+from app.models.maatregel import Maatregel
+from app.models.maatregel_document import MaatregelDocument
 
 __all__ = [
-    "AAALexProject",
-    "AanvraagDocument",
     "AanvraagStatus",
     "DeadlineStatus",
+    "DeadlineTiming",
     "DeadlineType",
     "DocumentType",
     "EigenaarType",
-    "Energielabel",
-    "InstallateurLead",
+    "EnergielabelKlasse",
     "LeadStatus",
-    "LegacyMaatregel",
-    "Maatregel",
-    "MaatregelDeadlineType",
-    "MaatregelDocument",
+    "MaatregelEnum",
     "MaatregelDocumentType",
     "MaatregelStatus",
     "MaatregelType",
-    "Organisation",
     "OrganisationType",
-    "Pand",
     "PandType",
     "RegelingCode",
-    "RegelingConfig",
-    "SubsidieAanvraag",
     "TypeAanvrager",
-    "User",
     "UserRole",
+    "Organisation",
+    "User",
+    "SubsidieAanvraag",
+    "AanvraagDocument",
+    "InstallateurLead",
+    "RegelingConfig",
+    "AAALexProject",
+    "Pand",
+    "Maatregel",
+    "MaatregelDocument",
 ]

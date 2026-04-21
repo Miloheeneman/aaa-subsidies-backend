@@ -89,14 +89,18 @@ class SubscriptionPlan(str, enum.Enum):
 PAID_PLANS = frozenset({SubscriptionPlan.starter.value, SubscriptionPlan.pro.value})
 
 
+# Hard caps per plan for the panden module. None = unlimited.
+# Admins bypass this check entirely (see app.services.plan_service).
+PAND_LIMIT_PER_PLAN: dict[str, int | None] = {
+    SubscriptionPlan.gratis.value: 3,
+    SubscriptionPlan.starter.value: 30,
+    SubscriptionPlan.pro.value: 100,
+    SubscriptionPlan.enterprise.value: None,
+}
+
+
 # ---------------------------------------------------------------------------
-# Panden module (stap 9) — enums
-#
-# We opzettelijk nieuwe, gescheiden enums gebruiken i.p.v. de bestaande
-# ``Maatregel`` / ``DeadlineType`` / ``DocumentType`` die de legacy
-# subsidie-aanvraag flow aandrijven. Zo kan de oude aanvraag-module
-# ongestoord blijven draaien terwijl deze module zijn eigen lifecycle
-# heeft.
+# Panden module (STAP 9)
 # ---------------------------------------------------------------------------
 
 
@@ -119,7 +123,7 @@ class EigenaarType(str, enum.Enum):
     overig = "overig"
 
 
-class Energielabel(str, enum.Enum):
+class EnergielabelKlasse(str, enum.Enum):
     A = "A"
     B = "B"
     C = "C"
@@ -152,7 +156,9 @@ class MaatregelStatus(str, enum.Enum):
     afgewezen = "afgewezen"
 
 
-class MaatregelDeadlineType(str, enum.Enum):
+class DeadlineTiming(str, enum.Enum):
+    """Whether the deadline counts from installation or pre-offer."""
+
     na_installatie = "na_installatie"
     voor_offerte = "voor_offerte"
 
@@ -174,13 +180,3 @@ class MaatregelDocumentType(str, enum.Enum):
     kvk_uittreksel = "kvk_uittreksel"
     machtiging = "machtiging"
     overig = "overig"
-
-
-# Per-plan pand limieten (zie plan-enforcement middleware).
-PLAN_PAND_LIMITS: dict[str, int | None] = {
-    SubscriptionPlan.gratis.value: 3,
-    SubscriptionPlan.starter.value: 30,
-    SubscriptionPlan.pro.value: 100,
-    # enterprise = onbeperkt (None)
-    SubscriptionPlan.enterprise.value: None,
-}

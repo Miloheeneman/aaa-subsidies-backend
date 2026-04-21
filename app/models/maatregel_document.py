@@ -1,10 +1,11 @@
+"""Document uploaded against a Maatregel (invoice, meldcode, photos, …)."""
 from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -13,16 +14,11 @@ from app.models.enums import MaatregelDocumentType
 from app.models.mixins import UUIDPKMixin
 
 if TYPE_CHECKING:
-    from app.models.pand_maatregel import Maatregel
+    from app.models.maatregel import Maatregel
     from app.models.user import User
 
 
 class MaatregelDocument(UUIDPKMixin, Base):
-    """Een documentupload gekoppeld aan één maatregel.
-
-    Pad in R2: ``{organisation_id}/panden/{pand_id}/maatregelen/{maatregel_id}/{document_id}/{filename}``.
-    """
-
     __tablename__ = "maatregel_documenten"
 
     maatregel_id: Mapped[uuid.UUID] = mapped_column(
@@ -31,6 +27,7 @@ class MaatregelDocument(UUIDPKMixin, Base):
         nullable=False,
         index=True,
     )
+
     document_type: Mapped[MaatregelDocumentType] = mapped_column(
         Enum(
             MaatregelDocumentType,
@@ -39,6 +36,7 @@ class MaatregelDocument(UUIDPKMixin, Base):
         ),
         nullable=False,
     )
+
     bestandsnaam: Mapped[str] = mapped_column(String(512), nullable=False)
     r2_key: Mapped[str] = mapped_column(String(1024), nullable=False)
 
@@ -46,10 +44,12 @@ class MaatregelDocument(UUIDPKMixin, Base):
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="RESTRICT"),
         nullable=False,
+        index=True,
     )
     geverifieerd_door_admin: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false", nullable=False
     )
+    notities: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
