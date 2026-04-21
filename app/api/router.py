@@ -8,6 +8,8 @@ from app.api.routes import (
     documenten,
     health,
     installateur,
+    maatregelen,
+    panden,
     stripe_routes,
     subscriptions,
     subsidiecheck,
@@ -21,6 +23,9 @@ api_router.include_router(users.router)
 api_router.include_router(subsidiecheck.router)
 api_router.include_router(aanvragen.router)
 api_router.include_router(documenten.router)
+api_router.include_router(panden.router)
+api_router.include_router(maatregelen.panden_nested)
+api_router.include_router(maatregelen.maatregelen_router)
 api_router.include_router(admin.router)
 api_router.include_router(aaa_lex.router)
 api_router.include_router(installateur.router)

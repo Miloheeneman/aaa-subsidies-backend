@@ -24,7 +24,7 @@ reset_db() {
 }
 
 FAIL=0
-for suite in e2e_smoke e2e_subsidiecheck e2e_aanvragen e2e_documenten_admin e2e_installateur_stripe e2e_deadline_regelingen e2e_onboarding; do
+for suite in e2e_smoke e2e_subsidiecheck e2e_aanvragen e2e_documenten_admin e2e_installateur_stripe e2e_deadline_regelingen e2e_onboarding e2e_panden; do
   echo ""
   echo "==================== $suite ===================="
   reset_db
