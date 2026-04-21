@@ -238,4 +238,29 @@ class QuotaInfo(BaseModel):
     exceeded: bool = False
 
 
+# ---------------------------------------------------------------------------
+# Subsidie matching
+# ---------------------------------------------------------------------------
+
+
+class SubsidieMatchOut(BaseModel):
+    """Eén regeling-match voor een pand (zie panden_service.SubsidieMatch)."""
+
+    code: str
+    naam: str
+    beschrijving: str
+    max_subsidie: Optional[float] = None
+    fee_percentage: float
+    deadline_type: str  # "na_installatie" | "voor_offerte"
+    deadline_maanden: int
+    eligible: bool
+    reden: Optional[str] = None
+
+
+class SubsidieMatchResponse(BaseModel):
+    pand_id: UUID
+    eligible: List[SubsidieMatchOut]
+    niet_eligible: List[SubsidieMatchOut]
+
+
 PandListResponse.model_rebuild()

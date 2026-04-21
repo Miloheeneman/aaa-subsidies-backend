@@ -48,6 +48,8 @@ from app.schemas.panden import (
     PandOut,
     PandUpdate,
     QuotaInfo,
+    SubsidieMatchOut,
+    SubsidieMatchResponse,
     UploadUrlRequest,
     UploadUrlResponse,
 )
@@ -56,6 +58,7 @@ from app.services.panden_service import (
     allowed_document_types,
     calculate_deadline,
     estimate_subsidie,
+    get_matching_subsidies,
     get_required_documents,
     infer_regeling,
 )
@@ -367,6 +370,38 @@ def delete_pand(
     pand.deleted_at = datetime.now(timezone.utc)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# Subsidie matching
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/panden/{pand_id}/subsidies",
+    response_model=SubsidieMatchResponse,
+)
+def get_subsidies_voor_pand(
+    pand_id: UUID, user: VerifiedUser, db: DbSession
+) -> SubsidieMatchResponse:
+    """Welke subsidies passen bij dit pand?
+
+    Gebruikt :func:`panden_service.get_matching_subsidies` als single source
+    of truth en splitst de uitkomst in eligible / niet-eligible voor de UI.
+    """
+    pand = _pand_or_403(db, pand_id, user)
+    matches = get_matching_subsidies(pand)
+    eligible = [
+        SubsidieMatchOut(**m.__dict__) for m in matches if m.eligible
+    ]
+    niet_eligible = [
+        SubsidieMatchOut(**m.__dict__) for m in matches if not m.eligible
+    ]
+    return SubsidieMatchResponse(
+        pand_id=pand.id,
+        eligible=eligible,
+        niet_eligible=niet_eligible,
+    )
 
 
 # ---------------------------------------------------------------------------

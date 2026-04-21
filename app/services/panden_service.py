@@ -19,13 +19,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import List, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 from app.models.enums import (
     DeadlineStatus,
     DeadlineTiming,
+    EigenaarType,
     MaatregelDocumentType,
     MaatregelType,
+    PandType,
     RegelingCode,
 )
 
@@ -339,3 +341,263 @@ def estimate_subsidie(
             return float(cap)
         return float(raw)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Subsidie matching engine
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SubsidieMatch:
+    """One regeling evaluated against a single :class:`Pand`."""
+
+    code: str
+    naam: str
+    beschrijving: str
+    max_subsidie: Optional[float]
+    fee_percentage: float
+    deadline_type: str  # "na_installatie" | "voor_offerte"
+    deadline_maanden: int
+    eligible: bool
+    reden: Optional[str] = None
+
+
+# Een eligibility-check is een lijst van (predikaat, faal-reden) tuples.
+# Predikaten krijgen het pand mee en geven True terug als de voorwaarde
+# voldoet. ``_evaluate`` walkt deze door:
+#   * alle voldaan → eligible=True
+#   * exact 1 niet voldaan → eligible=False met die reden ("bijna" match)
+#   * meer dan 1 niet voldaan → niet relevant, niet teruggeven
+_Predicate = Tuple[
+    "callable[[object], bool]",  # type: ignore[type-arg]
+    str,
+]
+
+
+_WOON_TYPES = {PandType.woning, PandType.appartement}
+_PARTICULIER_EIGENAREN = {
+    EigenaarType.eigenaar_bewoner,
+    EigenaarType.particulier_verhuurder,
+}
+_ISDE_WP_EIGENAREN = _PARTICULIER_EIGENAREN | {
+    EigenaarType.zakelijk_verhuurder,
+}
+_EIA_EIGENAREN = {EigenaarType.zakelijk_verhuurder, EigenaarType.overig}
+_EIA_PAND_TYPES = {PandType.kantoor, PandType.bedrijfspand}
+_DUMAVA_PAND_TYPES = {
+    PandType.zorginstelling,
+    PandType.school,
+    PandType.sportaccommodatie,
+}
+
+
+def _evaluate(
+    pand: object,
+    base: dict,
+    checks: Iterable[_Predicate],
+    *,
+    near_miss_threshold: int = 1,
+) -> Optional[SubsidieMatch]:
+    """Run alle predikaten en bouw een :class:`SubsidieMatch` of ``None``."""
+    failures: List[str] = []
+    for predicate, reason in checks:
+        if not predicate(pand):
+            failures.append(reason)
+
+    if not failures:
+        return SubsidieMatch(**base, eligible=True, reden=None)
+    if len(failures) <= near_miss_threshold:
+        return SubsidieMatch(**base, eligible=False, reden=failures[0])
+    return None
+
+
+def _match_isde_warmtepomp(pand: object) -> Optional[SubsidieMatch]:
+    base = dict(
+        code="ISDE_WARMTEPOMP",
+        naam="ISDE — Warmtepomp",
+        beschrijving=(
+            "Subsidie voor installatie van een warmtepomp in uw woning."
+        ),
+        max_subsidie=3500.0,
+        fee_percentage=8.0,
+        deadline_type="na_installatie",
+        deadline_maanden=24,
+    )
+    return _evaluate(
+        pand,
+        base,
+        [
+            (lambda p: p.bouwjaar < 2019, "Bouwjaar moet vóór 2019 zijn voor ISDE"),
+            (
+                lambda p: p.eigenaar_type in _ISDE_WP_EIGENAREN,
+                "ISDE warmtepomp is alleen voor eigenaar-bewoners en verhuurders",
+            ),
+            (
+                lambda p: p.pand_type in _WOON_TYPES,
+                "ISDE warmtepomp is alleen voor woningen of appartementen",
+            ),
+        ],
+    )
+
+
+def _match_isde_isolatie(pand: object) -> Optional[SubsidieMatch]:
+    base = dict(
+        code="ISDE_ISOLATIE",
+        naam="ISDE — Isolatie",
+        beschrijving=(
+            "Subsidie voor dak, gevel, vloer of HR++ glas isolatie."
+        ),
+        max_subsidie=3000.0,
+        fee_percentage=8.0,
+        deadline_type="na_installatie",
+        deadline_maanden=24,
+    )
+    return _evaluate(
+        pand,
+        base,
+        [
+            (lambda p: p.bouwjaar < 2019, "Bouwjaar moet vóór 2019 zijn voor ISDE"),
+            (
+                lambda p: p.eigenaar_type in _PARTICULIER_EIGENAREN,
+                "ISDE isolatie is alleen voor eigenaar-bewoners en particuliere verhuurders",
+            ),
+            (
+                lambda p: p.pand_type in _WOON_TYPES,
+                "ISDE isolatie is alleen voor woningen of appartementen",
+            ),
+        ],
+    )
+
+
+def _match_eia(pand: object) -> Optional[SubsidieMatch]:
+    base = dict(
+        code="EIA",
+        naam="EIA — Energie Investeringsaftrek",
+        beschrijving=(
+            "45,5% fiscale aftrek op energiebesparende investeringen."
+        ),
+        max_subsidie=None,
+        fee_percentage=5.0,
+        deadline_type="voor_offerte",
+        deadline_maanden=3,
+    )
+    return _evaluate(
+        pand,
+        base,
+        [
+            (
+                lambda p: p.eigenaar_type in _EIA_EIGENAREN,
+                "EIA is alleen voor zakelijke eigenaren",
+            ),
+            (
+                lambda p: p.pand_type in _EIA_PAND_TYPES,
+                "EIA is bedoeld voor kantoor- of bedrijfspanden",
+            ),
+        ],
+    )
+
+
+def _match_mia_vamil(pand: object) -> Optional[SubsidieMatch]:
+    base = dict(
+        code="MIA_VAMIL",
+        naam="MIA + Vamil",
+        beschrijving=(
+            "27-45% milieu-investeringsaftrek plus liquiditeitsvoordeel."
+        ),
+        max_subsidie=None,
+        fee_percentage=5.0,
+        deadline_type="voor_offerte",
+        deadline_maanden=3,
+    )
+    return _evaluate(
+        pand,
+        base,
+        [
+            (
+                lambda p: p.eigenaar_type in _EIA_EIGENAREN,
+                "MIA/Vamil is alleen voor zakelijke eigenaren",
+            ),
+            (
+                lambda p: p.pand_type in _EIA_PAND_TYPES,
+                "MIA/Vamil is bedoeld voor kantoor- of bedrijfspanden",
+            ),
+        ],
+    )
+
+
+def _match_dumava(pand: object) -> Optional[SubsidieMatch]:
+    base = dict(
+        code="DUMAVA",
+        naam="DUMAVA",
+        beschrijving=(
+            "Tot 30% subsidie voor verduurzaming van maatschappelijk vastgoed."
+        ),
+        max_subsidie=150000.0,
+        fee_percentage=10.0,
+        deadline_type="na_installatie",
+        deadline_maanden=24,
+    )
+    # Twee aparte routes: maatschappelijk pand, OF VvE met overig pand.
+    is_maatschappelijk = pand.pand_type in _DUMAVA_PAND_TYPES
+    is_vve_overig = (
+        pand.eigenaar_type == EigenaarType.vve
+        and pand.pand_type == PandType.overig
+    )
+    if is_maatschappelijk or is_vve_overig:
+        return SubsidieMatch(**base, eligible=True, reden=None)
+
+    # "Bijna" match: VvE met een ander panden-type — we melden dat het
+    # alleen voor maatschappelijk vastgoed of VvE-overig geldt.
+    if pand.eigenaar_type == EigenaarType.vve:
+        return SubsidieMatch(
+            **base,
+            eligible=False,
+            reden=(
+                "DUMAVA is voor maatschappelijk vastgoed of VvE met "
+                "pand-type 'overig'"
+            ),
+        )
+    return None
+
+
+def _match_svve(pand: object) -> Optional[SubsidieMatch]:
+    base = dict(
+        code="SVVE",
+        naam="SVVE — VvE verduurzaming",
+        beschrijving="Subsidie voor verduurzaming van VvE gebouwen.",
+        max_subsidie=5000.0,
+        fee_percentage=8.0,
+        deadline_type="na_installatie",
+        deadline_maanden=24,
+    )
+    if pand.eigenaar_type == EigenaarType.vve:
+        return SubsidieMatch(**base, eligible=True, reden=None)
+    return None
+
+
+_MATCHERS = (
+    _match_isde_warmtepomp,
+    _match_isde_isolatie,
+    _match_eia,
+    _match_mia_vamil,
+    _match_dumava,
+    _match_svve,
+)
+
+
+def get_matching_subsidies(pand: object) -> List[SubsidieMatch]:
+    """Bepaal alle subsidies die voor dit pand relevant zijn.
+
+    De terugkomende lijst bevat zowel ``eligible=True`` (volledig matchend)
+    als ``eligible=False`` (bijna-match, met ``reden``). Niet-relevante
+    regelingen worden weggelaten.
+
+    De caller (route-laag) splitst de lijst in eligible/niet_eligible.
+    """
+    results: List[SubsidieMatch] = []
+    for matcher in _MATCHERS:
+        m = matcher(pand)
+        if m is not None:
+            results.append(m)
+    return results
