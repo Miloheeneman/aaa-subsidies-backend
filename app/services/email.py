@@ -11,7 +11,7 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
-BRAND_GREEN = "#2d6a2d"
+BRAND_GREEN = "#5a9e1e"
 BRAND_GREEN_LIGHT = "#e8f5e8"
 
 
