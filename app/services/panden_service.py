@@ -343,6 +343,29 @@ def estimate_subsidie(
     return None
 
 
+# m²-tarief (€/m²) en plafond voor ISDE-isolatie wizard (RVO-richting).
+_ISOLATIE_M2_TARIEVEN: dict[MaatregelType, tuple[float, float]] = {
+    MaatregelType.dakisolatie: (16.25, 3000.0),
+    MaatregelType.gevelisolatie: (14.50, 2500.0),
+    MaatregelType.vloerisolatie: (12.00, 1500.0),
+    MaatregelType.hr_glas: (65.00, 2000.0),
+}
+
+
+def estimate_isolatie_subsidie_from_m2(
+    maatregel_type: MaatregelType, oppervlakte_m2: float
+) -> float:
+    """Geschatte ISDE-subsidie op basis van m² (wizard ISDE isolatie).
+
+    Gebruikt door de isolatie-intake zodat dit gelijk blijft aan de UI.
+    """
+    if maatregel_type not in _ISOLATIE_M2_TARIEVEN:
+        return 0.0
+    rate, cap = _ISOLATIE_M2_TARIEVEN[maatregel_type]
+    raw = round(oppervlakte_m2 * rate, 2)
+    return float(min(raw, cap))
+
+
 # ---------------------------------------------------------------------------
 # Subsidie matching engine
 # ---------------------------------------------------------------------------

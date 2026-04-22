@@ -5,7 +5,7 @@ from datetime import date, datetime
 from typing import List, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.models.enums import (
     DeadlineStatus,
@@ -284,6 +284,45 @@ class IsdeWarmtepompAanvraagCreate(BaseModel):
     investering_bedrag: Optional[float] = Field(default=None, ge=0)
     heeft_offerte: bool = False
     offerte_datum: Optional[date] = None
+
+
+class IsdeIsolatieTypeIn(BaseModel):
+    """Eén isolatietype binnen de ISDE-isolatie wizard."""
+
+    maatregel_type: Literal["dakisolatie", "gevelisolatie", "vloerisolatie", "hr_glas"]
+    oppervlakte_m2: float = Field(gt=0)
+    meldcode_materiaal: Optional[str] = Field(default=None, max_length=128)
+    al_uitgevoerd: bool = False
+    uitvoeringsdatum: Optional[date] = None
+    investering_bedrag: Optional[float] = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_isolatie_type(self) -> "IsdeIsolatieTypeIn":
+        if self.maatregel_type == "hr_glas" and self.oppervlakte_m2 < 3:
+            raise ValueError(
+                "Voor HR++ glas is minimaal 3 m² vereist voor ISDE"
+            )
+        if self.al_uitgevoerd and self.uitvoeringsdatum is None:
+            raise ValueError(
+                "Vul de uitvoeringsdatum in als de isolatie al is uitgevoerd"
+            )
+        return self
+
+
+class IsdeIsolatieAanvraagCreate(BaseModel):
+    """Payload voor de ISDE isolatie intake-wizard (meerdere maatregelen)."""
+
+    items: List[IsdeIsolatieTypeIn] = Field(min_length=1, max_length=4)
+    installateur_naam: str = Field(min_length=1, max_length=255)
+    installateur_kvk: Optional[str] = Field(default=None, max_length=32)
+    installatie_of_geplande_datum: Optional[date] = None
+
+    @model_validator(mode="after")
+    def _unique_types(self) -> "IsdeIsolatieAanvraagCreate":
+        ts = [i.maatregel_type for i in self.items]
+        if len(ts) != len(set(ts)):
+            raise ValueError("Elk isolatietype maximaal één keer kiezen")
+        return self
 
 
 PandListResponse.model_rebuild()

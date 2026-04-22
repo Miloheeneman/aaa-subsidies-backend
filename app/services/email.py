@@ -412,3 +412,35 @@ def send_admin_isde_warmtepomp_intake_email(
         subject=subject,
         html=_wrap("Nieuwe ISDE warmtepomp aanvraag", body),
     )
+
+
+def send_admin_isde_isolatie_intake_email(
+    *,
+    to: str,
+    subject: str,
+    pand_adres: str,
+    rows_html: str,
+) -> None:
+    """Admin-notificatie: nieuwe ISDE isolatie-intake(s) via klantwizard."""
+    body = f"""\
+<p style="margin:0 0 12px 0;">
+  Er zijn nieuwe ISDE isolatie-aanvragen binnengekomen via AAA-Subsidies
+  (één maatregel per isolatietype).
+</p>
+<p style="margin:0 0 12px 0;">
+  <strong>Pand:</strong> {html.escape(pand_adres)}
+</p>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0"
+       style="margin:8px 0 0 0;width:100%;font-size:14px;color:#374151;">
+  {rows_html}
+</table>
+<p style="margin:20px 0 0 0;font-size:13px;color:#4b5563;">
+  Log in op het admin-dashboard om de dossiers te bekijken en verder te
+  begeleiden.
+</p>
+"""
+    send_email(
+        to=to,
+        subject=subject,
+        html=_wrap("Nieuwe ISDE isolatie aanvraag", body),
+    )

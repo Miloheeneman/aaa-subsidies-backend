@@ -51,6 +51,7 @@ from app.schemas.panden import (
     PandOut,
     PandUpdate,
     QuotaInfo,
+    IsdeIsolatieAanvraagCreate,
     IsdeWarmtepompAanvraagCreate,
     SubsidieMatchOut,
     SubsidieMatchResponse,
@@ -58,10 +59,14 @@ from app.schemas.panden import (
     UploadUrlResponse,
 )
 from app.services import r2_storage
-from app.services.email import send_admin_isde_warmtepomp_intake_email
+from app.services.email import (
+    send_admin_isde_isolatie_intake_email,
+    send_admin_isde_warmtepomp_intake_email,
+)
 from app.services.panden_service import (
     allowed_document_types,
     calculate_deadline,
+    estimate_isolatie_subsidie_from_m2,
     estimate_subsidie,
     get_matching_subsidies,
     get_required_documents,
@@ -573,9 +578,171 @@ def create_isde_warmtepomp_aanvraag(
     return MaatregelOut.model_validate(m)
 
 
-# ---------------------------------------------------------------------------
-# Maatregelen
-# ---------------------------------------------------------------------------
+_ISOL_WIZARD_LABELS: dict[MaatregelType, str] = {
+    MaatregelType.dakisolatie: "Dakisolatie",
+    MaatregelType.gevelisolatie: "Gevelisolatie",
+    MaatregelType.vloerisolatie: "Vloerisolatie",
+    MaatregelType.hr_glas: "HR++ glas",
+}
+
+
+@router.post(
+    "/panden/{pand_id}/aanvragen/isde-isolatie",
+    response_model=List[MaatregelOut],
+    status_code=status.HTTP_201_CREATED,
+)
+def create_isde_isolatie_aanvragen(
+    pand_id: UUID,
+    payload: IsdeIsolatieAanvraagCreate,
+    user: VerifiedUser,
+    db: DbSession,
+) -> List[MaatregelOut]:
+    """Wizard-submit: één Maatregel per gekozen isolatietype op hetzelfde pand."""
+    pand = _pand_or_403(db, pand_id, user)
+
+    def _strip_opt(s: Optional[str]) -> Optional[str]:
+        if s is None:
+            return None
+        t = s.strip()
+        return t or None
+
+    created: List[Maatregel] = []
+    for item in payload.items:
+        mt = MaatregelType(item.maatregel_type)
+        if mt not in _ISOL_WIZARD_LABELS:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Ongeldig isolatietype: {item.maatregel_type}",
+            )
+
+        if item.al_uitgevoerd and item.uitvoeringsdatum:
+            inst_datum = item.uitvoeringsdatum
+        else:
+            inst_datum = payload.installatie_of_geplande_datum
+
+        m_status = (
+            MaatregelStatus.gepland
+            if item.al_uitgevoerd and item.uitvoeringsdatum
+            else MaatregelStatus.orientatie
+        )
+        label = _ISOL_WIZARD_LABELS[mt]
+        oms = (
+            f"ISDE isolatie — wizard ({label}, {item.oppervlakte_m2:g} m²)"
+        )
+
+        m = Maatregel(
+            pand_id=pand.id,
+            created_by=user.id,
+            maatregel_type=mt,
+            omschrijving=oms,
+            status=m_status,
+            apparaat_meldcode=_strip_opt(item.meldcode_materiaal),
+            installateur_naam=payload.installateur_naam.strip(),
+            installateur_kvk=_strip_opt(payload.installateur_kvk),
+            installateur_gecertificeerd=False,
+            installatie_datum=inst_datum,
+            investering_bedrag=item.investering_bedrag,
+            regeling_code=RegelingCode.ISDE,
+            geschatte_subsidie=estimate_isolatie_subsidie_from_m2(
+                mt, item.oppervlakte_m2
+            ),
+        )
+        _recalc_deadline(m)
+        db.add(m)
+        created.append(m)
+
+    db.commit()
+    for m in created:
+        db.refresh(m)
+
+    pand_adres = (
+        f"{pand.straat} {pand.huisnummer}, {pand.postcode} {pand.plaats}"
+    )
+    subject = f"Nieuwe ISDE isolatie aanvraag — {pand_adres}"
+
+    rows: List[str] = [
+        _email_row("Klant-e-mail", user.email),
+        _email_row(
+            "Installateur / uitvoerder",
+            payload.installateur_naam.strip(),
+        ),
+        _email_row("KvK uitvoerder", _strip_opt(payload.installateur_kvk)),
+        _email_row(
+            "Geplande / algemene datum",
+            payload.installatie_of_geplande_datum.isoformat()
+            if payload.installatie_of_geplande_datum
+            else None,
+        ),
+    ]
+    for idx, m in enumerate(created):
+        if idx:
+            rows.append(
+                '<tr><td colspan="2" style="padding:8px 0;border-top:1px solid #e5e7eb;"></td></tr>'
+            )
+        item = next(
+            (
+                i
+                for i in payload.items
+                if i.maatregel_type == m.maatregel_type.value
+            ),
+            None,
+        )
+        rows.append(
+            _email_row(
+                "Type",
+                _ISOL_WIZARD_LABELS.get(m.maatregel_type, m.maatregel_type.value),
+            )
+        )
+        if item:
+            rows.append(_email_row("Oppervlakte (m²)", f"{item.oppervlakte_m2:g}"))
+            rows.append(
+                _email_row(
+                    "Al uitgevoerd",
+                    "Ja" if item.al_uitgevoerd else "Nee",
+                )
+            )
+            if item.uitvoeringsdatum:
+                rows.append(
+                    _email_row(
+                        "Uitvoeringsdatum",
+                        item.uitvoeringsdatum.isoformat(),
+                    )
+                )
+        rows.append(_email_row("Meldcode", m.apparaat_meldcode))
+        rows.append(
+            _email_row(
+                "Investering (€)",
+                f"{m.investering_bedrag:.2f}"
+                if m.investering_bedrag is not None
+                else None,
+            )
+        )
+        rows.append(
+            _email_row(
+                "Geschatte subsidie (€)",
+                f"{m.geschatte_subsidie:.2f}"
+                if m.geschatte_subsidie is not None
+                else None,
+            )
+        )
+        rows.append(
+            _email_row(
+                "Deadline indienen",
+                m.deadline_indienen.isoformat() if m.deadline_indienen else None,
+            )
+        )
+        rows.append(_email_row("Maatregel-ID", str(m.id)))
+
+    rows_html = "".join(rows)
+    for admin_to in _admin_notification_recipients(db):
+        send_admin_isde_isolatie_intake_email(
+            to=admin_to,
+            subject=subject,
+            pand_adres=pand_adres,
+            rows_html=rows_html,
+        )
+
+    return [MaatregelOut.model_validate(m) for m in created]
 
 
 @router.get(
