@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 from app.api.deps import DbSession, require_verified
 from app.models import User
@@ -30,10 +30,14 @@ def list_notifications(user: VerifiedUser, db: DbSession) -> KlantNotificatieLis
     )
 
 
-@router.post("/{notification_id}/read", status_code=status.HTTP_204_NO_CONTENT)
+@router.post(
+    "/{notification_id}/read",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
 def mark_notification_read(
     notification_id: UUID, user: VerifiedUser, db: DbSession
-) -> None:
+) -> Response:
     if user.role != UserRole.klant:
         raise HTTPException(status_code=403, detail="Alleen voor klanten")
     ok = klant_notifications.mark_read(
@@ -42,11 +46,17 @@ def mark_notification_read(
     if not ok:
         raise HTTPException(status_code=404, detail="Notificatie niet gevonden")
     db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.post("/read-all", status_code=status.HTTP_204_NO_CONTENT)
-def mark_all_notifications_read(user: VerifiedUser, db: DbSession) -> None:
+@router.post(
+    "/read-all",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
+def mark_all_notifications_read(user: VerifiedUser, db: DbSession) -> Response:
     if user.role != UserRole.klant:
         raise HTTPException(status_code=403, detail="Alleen voor klanten")
     klant_notifications.mark_all_read(db, user_id=user.id)
     db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

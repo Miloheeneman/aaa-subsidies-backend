@@ -44,7 +44,6 @@ from app.schemas.admin_portal import (
     ActivityItemOut,
     AdminNoteCreate,
     AdminNoteOut,
-    AdminPortalStats,
     DossierListItemOut,
     DossierListPage,
     KlantDetailOut,
@@ -88,70 +87,6 @@ def _checklist_counts(db, m: Maatregel) -> tuple[int, int]:
     have_types = set(rows)
     geupload = sum(1 for c in verplicht if c.document_type in have_types)
     return len(verplicht), geupload
-
-
-@router.get("/stats", response_model=AdminPortalStats)
-def portal_stats(db: DbSession) -> AdminPortalStats:
-    today = date.today()
-    start = datetime.combine(today.replace(day=1), datetime.min.time(), tzinfo=timezone.utc)
-
-    totaal_klanten = int(
-        db.execute(
-            select(func.count())
-            .select_from(Organisation)
-            .where(Organisation.type == OrganisationType.klant)
-        ).scalar_one()
-    )
-    projecten_deze_maand = int(
-        db.execute(
-            select(func.count())
-            .select_from(Project)
-            .where(Project.created_at >= start, Project.is_deleted.is_(False))
-        ).scalar_one()
-    )
-    openstaande_dossiers = int(
-        db.execute(
-            select(func.count())
-            .select_from(Maatregel)
-            .where(
-                Maatregel.status.notin_(
-                    [MaatregelStatus.goedgekeurd, MaatregelStatus.afgewezen]
-                ),
-                or_(
-                    Maatregel.deadline_status.in_(
-                        [
-                            DeadlineStatus.kritiek,
-                            DeadlineStatus.verlopen,
-                            DeadlineStatus.waarschuwing,
-                        ]
-                    ),
-                    Maatregel.status == MaatregelStatus.orientatie,
-                ),
-            )
-        ).scalar_one()
-    )
-    ingediend_deze_maand = int(
-        db.execute(
-            select(func.count())
-            .select_from(Maatregel)
-            .where(
-                Maatregel.status.in_(
-                    [
-                        MaatregelStatus.aangevraagd,
-                        MaatregelStatus.in_beoordeling,
-                    ]
-                ),
-                Maatregel.updated_at >= start,
-            )
-        ).scalar_one()
-    )
-
-    return AdminPortalStats(
-        totaal_klanten=totaal_klanten,
-        projecten_deze_maand=projecten_deze_maand,
-        openstaande_dossiers=openstaande_dossiers,
-        ingediend_deze_maand=ingediend_deze_maand,
-    )
 
 
 @router.get("/portal/action-items", response_model=list[ActionItemOut])

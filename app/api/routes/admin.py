@@ -45,7 +45,9 @@ from app.schemas.admin import (
     StatusCounts,
     StatusUpdateRequest,
 )
+from app.schemas.admin_portal import AdminPortalStats
 from app.schemas.documenten import DocumentOut
+from app.services.admin_portal_stats import compute_admin_portal_stats
 from app.services.deadline_service import (
     check_all_deadlines,
     check_maatregel_deadlines_admin,
@@ -166,6 +168,16 @@ def dashboard(db: DbSession) -> AdminDashboardResponse:
         deadlines_verlopen=int(deadlines_verlopen),
         deadlines_binnen_14_dagen=int(deadlines_binnen_14),
     )
+
+
+@router.get(
+    "/stats",
+    response_model=AdminPortalStats,
+    summary="Portal KPI (klanten, projecten, dossiers)",
+)
+def admin_portal_stats(db: DbSession) -> AdminPortalStats:
+    """Zelfde payload als voorheen onder admin_portal; nu op de hoofd-admin router."""
+    return compute_admin_portal_stats(db)
 
 
 # ---------------------------------------------------------------------------
@@ -417,10 +429,7 @@ def list_klanten(
     db: DbSession,
     q: Annotated[
         Optional[str],
-        Query(
-            default=None,
-            description="Zoek op organisatienaam of e-mail van een gebruiker",
-        ),
+        Query(description="Zoek op organisatienaam of e-mail van een gebruiker"),
     ] = None,
 ) -> list[KlantSummary]:
     stmt = (
