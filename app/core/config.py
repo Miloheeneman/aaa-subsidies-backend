@@ -105,7 +105,9 @@ class Settings(BaseSettings):
 
     RESEND_API_KEY: str = ""
     RESEND_FROM_EMAIL: str = "noreply@aaa-lexoffices.nl"
-    RESEND_FROM_NAME: str = "AAA-Lex Offices"
+    RESEND_FROM_NAME: str = "AAA-Subsidies"
+    # Komma-gescheiden mag; eerste adres wordt o.a. in klantmails getoond.
+    RESEND_ADMIN_EMAIL: str = "subsidies@aaa-lexoffices.nl"
     # Optioneel: één of meerdere (komma-gescheiden) inbox-adressen voor
     # admin-notificaties. Leeg = alle gebruikers met rol admin.
     ADMIN_NOTIFICATION_EMAIL: str = ""

@@ -152,6 +152,7 @@ class MaatregelStatus(str, enum.Enum):
     gepland = "gepland"
     uitgevoerd = "uitgevoerd"
     aangevraagd = "aangevraagd"
+    in_beoordeling = "in_beoordeling"
     goedgekeurd = "goedgekeurd"
     afgewezen = "afgewezen"
 
@@ -168,6 +169,14 @@ class DeadlineStatus(str, enum.Enum):
     waarschuwing = "waarschuwing"
     kritiek = "kritiek"
     verlopen = "verlopen"
+
+
+class AdminNotitieEntityType(str, enum.Enum):
+    """Entiteit waar een generieke admin-notitie aan hangt."""
+
+    klant = "klant"
+    project = "project"
+    maatregel = "maatregel"
 
 
 class MaatregelDocumentType(str, enum.Enum):

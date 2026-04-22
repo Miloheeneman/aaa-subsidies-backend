@@ -10,9 +10,8 @@ kleur kan tonen.
 """
 from __future__ import annotations
 
-import html
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, List, Optional
 from uuid import UUID, uuid4
 
@@ -27,6 +26,7 @@ from app.models import (
     MaatregelDocument,
     Organisation,
     Project,
+    UploadVerzoek,
     User,
 )
 from app.models.enums import (
@@ -51,8 +51,11 @@ from app.schemas.projecten import (
     ProjectCreate,
     ProjectDetailResponse,
     ProjectListResponse,
+    OpenUploadVerzoekOut,
     ProjectOut,
     ProjectUpdate,
+    PublicUploadDocItemOut,
+    PublicUploadMetaOut,
     QuotaInfo,
     IsdeIsolatieAanvraagCreate,
     IsdeWarmtepompAanvraagCreate,
@@ -61,14 +64,7 @@ from app.schemas.projecten import (
     UploadUrlRequest,
     UploadUrlResponse,
 )
-from app.services import r2_storage
-from app.services.email import (
-    send_admin_eia_intake_email,
-    send_admin_isde_isolatie_intake_email,
-    send_admin_isde_warmtepomp_intake_email,
-    send_admin_mia_vamil_intake_email,
-    send_admin_dumava_intake_email,
-)
+from app.services import email_service, r2_storage
 from app.services.projecten_service import (
     allowed_document_types,
     calculate_deadline,
@@ -77,6 +73,9 @@ from app.services.projecten_service import (
     get_matching_subsidies,
     get_required_documents,
     infer_regeling,
+    maybe_complete_upload_verzoek,
+    open_upload_verzoek_rows_for_project,
+    project_ids_with_open_upload_verzoek,
 )
 from app.services.plan_service import get_quota
 
@@ -123,17 +122,6 @@ def _maatregel_or_403(
     return m
 
 
-def _admin_notification_recipients(db: Session) -> List[str]:
-    """E-mailadressen voor admin-notificaties (Resend)."""
-    raw = (settings.ADMIN_NOTIFICATION_EMAIL or "").strip()
-    if raw:
-        return [e.strip() for e in raw.split(",") if e.strip()]
-    rows = db.execute(
-        select(User.email).where(User.role == UserRole.admin)
-    ).scalars().all()
-    return sorted({e for e in rows if e})
-
-
 def _quota_info(db: Session, user: User) -> QuotaInfo:
     q = get_quota(db, user)
     return QuotaInfo(
@@ -166,6 +154,9 @@ def _worst_deadline_status(
 def _project_to_out(project: Project, *, maatregelen: List[Maatregel]) -> ProjectOut:
     data = ProjectOut.model_validate(project)
     data.aantal_maatregelen = len(maatregelen)
+    data.totaal_geschatte_subsidie = sum(
+        float(m.geschatte_subsidie or 0) for m in maatregelen
+    )
     data.worst_deadline_status = _worst_deadline_status(
         [m.deadline_status for m in maatregelen]
     )
@@ -202,6 +193,182 @@ def _auto_estimate_subsidie(
     est = estimate_subsidie(m.maatregel_type, m.investering_bedrag)
     if est is not None:
         m.geschatte_subsidie = est
+
+
+def _primary_user_id_for_org(db: Session, organisation_id: UUID) -> Optional[UUID]:
+    return db.execute(
+        select(User.id)
+        .where(User.organisation_id == organisation_id)
+        .order_by(User.created_at.asc())
+    ).scalar_one_or_none()
+
+
+def _upload_verzoek_bundle(
+    db: Session, project_id: UUID, token: str
+) -> tuple[UploadVerzoek, Project, Maatregel]:
+    vz = db.execute(
+        select(UploadVerzoek).where(UploadVerzoek.token == token)
+    ).scalar_one_or_none()
+    if vz is None or vz.voltooid:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ongeldige of verlopen link",
+        )
+    if vz.token_expires_at < datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ongeldige of verlopen link",
+        )
+    m = db.get(Maatregel, vz.maatregel_id)
+    if m is None or m.project_id != project_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ongeldige of verlopen link",
+        )
+    p = db.get(Project, project_id)
+    if p is None or p.is_deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project niet gevonden",
+        )
+    return vz, p, m
+
+
+# ---------------------------------------------------------------------------
+# Publieke document-upload (token uit e-mail)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/projecten/{project_id}/documenten/upload/{token}",
+    response_model=PublicUploadMetaOut,
+)
+def public_upload_meta(
+    project_id: UUID, token: str, db: DbSession
+) -> PublicUploadMetaOut:
+    vz, p, m = _upload_verzoek_bundle(db, project_id, token)
+    raw_types = list(vz.document_types or [])
+    out_docs: list[PublicUploadDocItemOut] = []
+    for dt_s in raw_types:
+        try:
+            dt = MaatregelDocumentType(dt_s)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Ongeldige documentconfig in verzoek",
+            ) from exc
+        for c in get_required_documents(m.maatregel_type):
+            if c.document_type == dt:
+                out_docs.append(
+                    PublicUploadDocItemOut(
+                        document_type=dt.value,
+                        label=c.label,
+                        uitleg=c.uitleg,
+                    )
+                )
+                break
+    reg = m.regeling_code.value if m.regeling_code else "Subsidie"
+    adres = f"{p.straat} {p.huisnummer}, {p.postcode} {p.plaats}"
+    return PublicUploadMetaOut(
+        project_id=p.id,
+        maatregel_id=m.id,
+        subsidie_type=reg,
+        project_adres=adres,
+        bericht=vz.bericht,
+        documenten=out_docs,
+        token_expires_at=vz.token_expires_at,
+        deadline_indienen=m.deadline_indienen,
+    )
+
+
+@router.post(
+    "/projecten/{project_id}/documenten/upload/{token}/presign",
+    response_model=UploadUrlResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def public_upload_presign(
+    project_id: UUID,
+    token: str,
+    payload: UploadUrlRequest,
+    db: DbSession,
+) -> UploadUrlResponse:
+    vz, project, m = _upload_verzoek_bundle(db, project_id, token)
+    allowed_raw = {str(x) for x in (vz.document_types or [])}
+    if payload.document_type.value not in allowed_raw:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Dit documenttype hoort niet bij dit uploadverzoek",
+        )
+    allowed = allowed_document_types(m.maatregel_type)
+    if payload.document_type not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Documenttype niet geldig voor deze maatregel",
+        )
+    uploader = _primary_user_id_for_org(db, project.organisation_id)
+    if uploader is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Geen gebruiker gevonden voor deze organisatie",
+        )
+
+    document_id = uuid4()
+    object_key = (
+        f"{project.organisation_id}/projecten/{project.id}/maatregelen/{m.id}/"
+        f"{document_id}/{r2_storage.safe_filename(payload.bestandsnaam)}"
+    )
+    upload_url = r2_storage.generate_upload_url(
+        object_key, content_type=payload.content_type, expires_in=3600
+    )
+    doc = MaatregelDocument(
+        id=document_id,
+        maatregel_id=m.id,
+        document_type=payload.document_type,
+        bestandsnaam=r2_storage.safe_filename(payload.bestandsnaam),
+        r2_key=r2_storage.make_pending_url(object_key),
+        geupload_door=uploader,
+    )
+    db.add(doc)
+    db.commit()
+    return UploadUrlResponse(
+        upload_url=upload_url,
+        document_id=document_id,
+        r2_key=object_key,
+        expires_in=3600,
+    )
+
+
+@router.post(
+    "/projecten/{project_id}/documenten/upload/{token}/confirm/{document_id}",
+    response_model=DocumentOut,
+)
+def public_upload_confirm(
+    project_id: UUID,
+    token: str,
+    document_id: UUID,
+    db: DbSession,
+) -> DocumentOut:
+    vz, _p, m = _upload_verzoek_bundle(db, project_id, token)
+    doc = db.get(MaatregelDocument, document_id)
+    if doc is None or doc.maatregel_id != m.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document niet gevonden",
+        )
+    allowed_raw = {str(x) for x in (vz.document_types or [])}
+    if doc.document_type.value not in allowed_raw:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Dit document hoort niet bij dit uploadverzoek",
+        )
+    object_key = r2_storage.object_key_from_storage_url(doc.r2_key)
+    doc.r2_key = r2_storage.make_committed_url(object_key)
+    maybe_complete_upload_verzoek(db, vz)
+    db.commit()
+    db.refresh(doc)
+    out = DocumentOut.model_validate(doc).model_dump()
+    out["pending_upload"] = doc.r2_key.startswith("pending://")
+    return DocumentOut(**out)
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +408,8 @@ def list_projecten(
         for m in rows:
             maatregelen_per_project[m.project_id].append(m)
 
+    open_flags = project_ids_with_open_upload_verzoek(db, project_ids)
+
     # Admins krijgen de organisatie-naam mee zodat het admin-overzicht per
     # rij kan tonen van welke klant het project is.
     org_names: dict[UUID, str] = {}
@@ -256,6 +425,7 @@ def list_projecten(
     items = []
     for project in projecten:
         out = _project_to_out(project, maatregelen=maatregelen_per_project.get(project.id, []))
+        out.heeft_open_upload_verzoek = project.id in open_flags
         if _is_admin(user):
             out.organisation_name = org_names.get(project.organisation_id)
         items.append(out)
@@ -333,6 +503,11 @@ def get_project(
     )
     base = _project_to_out(project, maatregelen=maatregelen).model_dump()
     base["maatregelen"] = [MaatregelShort.model_validate(m) for m in maatregelen]
+    ou_rows = open_upload_verzoek_rows_for_project(db, project_id)
+    base["open_upload_verzoeken"] = [OpenUploadVerzoekOut(**r) for r in ou_rows]
+    base["heeft_open_upload_verzoek"] = bool(ou_rows)
+    if not _is_admin(user):
+        base["notities"] = None
     return ProjectDetailResponse.model_validate(base)
 
 
@@ -436,20 +611,6 @@ _ISDE_WP_SUBTYPE_LABELS: dict[MaatregelType, str] = {
     MaatregelType.warmtepomp_water_water: "Water/water warmtepomp",
     MaatregelType.warmtepomp_hybride: "Hybride warmtepomp",
 }
-
-
-def _email_row(label: str, value: object) -> str:
-    if value is None or value == "":
-        v_html = "—"
-    else:
-        v_html = html.escape(str(value))
-    return (
-        "<tr>"
-        f'<td style="padding:6px 12px 6px 0;font-weight:600;color:#6b7280;'
-        f'vertical-align:top;">{html.escape(label)}</td>'
-        f'<td style="padding:6px 0;">{v_html}</td>'
-        "</tr>"
-    )
 
 
 def _strip_optional_str(s: Optional[str]) -> Optional[str]:
@@ -565,69 +726,58 @@ def create_isde_warmtepomp_aanvraag(
     db.commit()
     db.refresh(m)
 
-    project_adres = (
-        f"{project.straat} {project.huisnummer}, {project.postcode} {project.plaats}"
-    )
-    subject = f"Nieuwe ISDE warmtepomp aanvraag — {project_adres}"
-
     situatie_txt = (
         "Ja, al geïnstalleerd"
         if payload.situatie == "geinstalleerd"
         else "Nog aan het oriënteren"
     )
-    rows = [
-        _email_row("Klant-e-mail", user.email),
-        _email_row("Situatie", situatie_txt),
-        _email_row(
+    row_tuples: List[tuple[str, Optional[str]]] = [
+        ("Klant-e-mail", user.email),
+        ("Situatie", situatie_txt),
+        (
             "Type warmtepomp",
             _ISDE_WP_SUBTYPE_LABELS.get(m_type, m_type.value),
         ),
-        _email_row("Merk", m.apparaat_merk),
-        _email_row("Typenummer", m.apparaat_typenummer),
-        _email_row("Meldcode", m.apparaat_meldcode),
-        _email_row("Installateur", m.installateur_naam),
-        _email_row("KvK installateur", m.installateur_kvk),
-        _email_row(
+        ("Merk", m.apparaat_merk),
+        ("Typenummer", m.apparaat_typenummer),
+        ("Meldcode", m.apparaat_meldcode),
+        ("Installateur", m.installateur_naam),
+        ("KvK installateur", m.installateur_kvk),
+        (
             "Gecertificeerd",
             "Ja" if m.installateur_gecertificeerd else "Nee",
         ),
-        _email_row(
+        (
             "Installatiedatum",
             m.installatie_datum.isoformat() if m.installatie_datum else None,
         ),
-        _email_row(
+        (
             "Geschatte investering (€)",
             f"{m.investering_bedrag:.2f}" if m.investering_bedrag is not None else None,
         ),
-        _email_row(
-            "Offerte",
-            "Ja"
-            if payload.heeft_offerte
-            else "Nee",
-        ),
-        _email_row(
+        ("Offerte", "Ja" if payload.heeft_offerte else "Nee"),
+        (
             "Offertedatum",
             m.offerte_datum.isoformat() if m.offerte_datum else None,
         ),
-        _email_row(
+        (
             "Geschatte subsidie (€)",
             f"{m.geschatte_subsidie:.2f}" if m.geschatte_subsidie is not None else None,
         ),
-        _email_row(
+        (
             "Deadline indienen",
             m.deadline_indienen.isoformat() if m.deadline_indienen else None,
         ),
-        _email_row("Maatregel-ID", str(m.id)),
+        ("Maatregel-ID", str(m.id)),
     ]
-    rows_html = "".join(rows)
-
-    for admin_to in _admin_notification_recipients(db):
-        send_admin_isde_warmtepomp_intake_email(
-            to=admin_to,
-            subject=subject,
-            project_adres=project_adres,
-            rows_html=rows_html,
-        )
+    email_service.notify_admins_new_wizard_maatregel(
+        db,
+        user=user,
+        project=project,
+        maatregel=m,
+        subsidie_type_label="ISDE (warmtepomp)",
+        wizard_rows=row_tuples,
+    )
 
     return MaatregelOut.model_validate(m)
 
@@ -709,30 +859,18 @@ def create_isde_isolatie_aanvragen(
     for m in created:
         db.refresh(m)
 
-    project_adres = (
-        f"{project.straat} {project.huisnummer}, {project.postcode} {project.plaats}"
-    )
-    subject = f"Nieuwe ISDE isolatie aanvraag — {project_adres}"
-
-    rows: List[str] = [
-        _email_row("Klant-e-mail", user.email),
-        _email_row(
-            "Installateur / uitvoerder",
-            payload.installateur_naam.strip(),
-        ),
-        _email_row("KvK uitvoerder", _strip_opt(payload.installateur_kvk)),
-        _email_row(
+    common_tuples: List[tuple[str, Optional[str]]] = [
+        ("Klant-e-mail", user.email),
+        ("Installateur / uitvoerder", payload.installateur_naam.strip()),
+        ("KvK uitvoerder", _strip_opt(payload.installateur_kvk)),
+        (
             "Geplande / algemene datum",
             payload.installatie_of_geplande_datum.isoformat()
             if payload.installatie_of_geplande_datum
             else None,
         ),
     ]
-    for idx, m in enumerate(created):
-        if idx:
-            rows.append(
-                '<tr><td colspan="2" style="padding:8px 0;border-top:1px solid #e5e7eb;"></td></tr>'
-            )
+    for m in created:
         item = next(
             (
                 i
@@ -741,59 +879,53 @@ def create_isde_isolatie_aanvragen(
             ),
             None,
         )
-        rows.append(
-            _email_row(
+        m_rows: List[tuple[str, Optional[str]]] = list(common_tuples)
+        m_rows.append(
+            (
                 "Type",
                 _ISOL_WIZARD_LABELS.get(m.maatregel_type, m.maatregel_type.value),
             )
         )
         if item:
-            rows.append(_email_row("Oppervlakte (m²)", f"{item.oppervlakte_m2:g}"))
-            rows.append(
-                _email_row(
-                    "Al uitgevoerd",
-                    "Ja" if item.al_uitgevoerd else "Nee",
-                )
+            m_rows.append(("Oppervlakte (m²)", f"{item.oppervlakte_m2:g}"))
+            m_rows.append(
+                ("Al uitgevoerd", "Ja" if item.al_uitgevoerd else "Nee")
             )
             if item.uitvoeringsdatum:
-                rows.append(
-                    _email_row(
-                        "Uitvoeringsdatum",
-                        item.uitvoeringsdatum.isoformat(),
-                    )
+                m_rows.append(
+                    ("Uitvoeringsdatum", item.uitvoeringsdatum.isoformat())
                 )
-        rows.append(_email_row("Meldcode", m.apparaat_meldcode))
-        rows.append(
-            _email_row(
+        m_rows.append(("Meldcode", m.apparaat_meldcode))
+        m_rows.append(
+            (
                 "Investering (€)",
                 f"{m.investering_bedrag:.2f}"
                 if m.investering_bedrag is not None
                 else None,
             )
         )
-        rows.append(
-            _email_row(
+        m_rows.append(
+            (
                 "Geschatte subsidie (€)",
                 f"{m.geschatte_subsidie:.2f}"
                 if m.geschatte_subsidie is not None
                 else None,
             )
         )
-        rows.append(
-            _email_row(
+        m_rows.append(
+            (
                 "Deadline indienen",
                 m.deadline_indienen.isoformat() if m.deadline_indienen else None,
             )
         )
-        rows.append(_email_row("Maatregel-ID", str(m.id)))
-
-    rows_html = "".join(rows)
-    for admin_to in _admin_notification_recipients(db):
-        send_admin_isde_isolatie_intake_email(
-            to=admin_to,
-            subject=subject,
-            project_adres=project_adres,
-            rows_html=rows_html,
+        m_rows.append(("Maatregel-ID", str(m.id)))
+        email_service.notify_admins_new_wizard_maatregel(
+            db,
+            user=user,
+            project=project,
+            maatregel=m,
+            subsidie_type_label="ISDE (isolatie)",
+            wizard_rows=m_rows,
         )
 
     return [MaatregelOut.model_validate(m) for m in created]
@@ -862,54 +994,44 @@ def create_eia_aanvraag(
     db.commit()
     db.refresh(m)
 
-    project_adres = (
-        f"{project.straat} {project.huisnummer}, {project.postcode} {project.plaats}"
-    )
-    subject = (
-        "[URGENT] Nieuwe EIA aanvraag — " if urgent else "Nieuwe EIA aanvraag — "
-    ) + project_adres
-
-    rows: List[str] = [
-        _email_row("Klant-e-mail", user.email),
-        _email_row("Bedrijfsnaam", payload.bedrijfsnaam.strip()),
-        _email_row("KvK", payload.kvk_nummer),
-        _email_row("Type investering", type_label),
-        _email_row(
-            "Geschatte investering (€)",
-            f"{float(payload.investering_bedrag):.2f}",
-        ),
-        _email_row(
+    row_tuples: List[tuple[str, Optional[str]]] = [
+        ("Klant-e-mail", user.email),
+        ("Bedrijfsnaam", payload.bedrijfsnaam.strip()),
+        ("KvK", payload.kvk_nummer),
+        ("Type investering", type_label),
+        ("Geschatte investering (€)", f"{float(payload.investering_bedrag):.2f}"),
+        (
             "Geplande startdatum",
             payload.geplande_startdatum.isoformat()
             if payload.geplande_startdatum
             else None,
         ),
-        _email_row("Al een offerte?", "Ja" if payload.heeft_offerte else "Nee"),
-        _email_row(
+        ("Al een offerte?", "Ja" if payload.heeft_offerte else "Nee"),
+        (
             "Offertedatum",
             payload.offerte_datum.isoformat() if payload.offerte_datum else None,
         ),
-        _email_row(
+        (
             "Deadline RVO (indicatie +3 mnd)",
             m.deadline_indienen.isoformat() if m.deadline_indienen else None,
         ),
-        _email_row(
+        (
             "Geschatte fiscale aftrek (€)",
             f"{m.geschatte_subsidie:.2f}" if m.geschatte_subsidie else None,
         ),
-        _email_row("Contactpersoon", contact_naam),
-        _email_row("Telefoon", tel),
-        _email_row("Maatregel-ID", str(m.id)),
+        ("Contactpersoon", contact_naam),
+        ("Telefoon", tel),
+        ("Maatregel-ID", str(m.id)),
     ]
-    rows_html = "".join(rows)
-    for admin_to in _admin_notification_recipients(db):
-        send_admin_eia_intake_email(
-            to=admin_to,
-            subject=subject,
-            project_adres=project_adres,
-            rows_html=rows_html,
-            urgent=urgent,
-        )
+    email_service.notify_admins_new_wizard_maatregel(
+        db,
+        user=user,
+        project=project,
+        maatregel=m,
+        subsidie_type_label="EIA",
+        wizard_rows=row_tuples,
+        urgent=urgent,
+    )
 
     return MaatregelOut.model_validate(m)
 
@@ -988,61 +1110,46 @@ def create_mia_vamil_aanvraag(
     inv = float(payload.investering_bedrag)
     vamil_indicatie = round(inv * _VAMIL_LIQUIDITEIT_INDICATIE_PCT, 2)
 
-    project_adres = (
-        f"{project.straat} {project.huisnummer}, {project.postcode} {project.plaats}"
-    )
-    subject = (
-        "[URGENT] Nieuwe MIA/Vamil aanvraag — "
-        if urgent
-        else "Nieuwe MIA/Vamil aanvraag — "
-    ) + project_adres
-
-    rows: List[str] = [
-        _email_row("Klant-e-mail", user.email),
-        _email_row("Bedrijfsnaam", payload.bedrijfsnaam.strip()),
-        _email_row("KvK", payload.kvk_nummer),
-        _email_row("Type milieu-investering", type_label),
-        _email_row("Milieulijst categoriecode", payload.milieulijst_categoriecode),
-        _email_row(
-            "Geschatte investering (€)",
-            f"{inv:.2f}",
-        ),
-        _email_row(
+    row_tuples: List[tuple[str, Optional[str]]] = [
+        ("Klant-e-mail", user.email),
+        ("Bedrijfsnaam", payload.bedrijfsnaam.strip()),
+        ("KvK", payload.kvk_nummer),
+        ("Type milieu-investering", type_label),
+        ("Milieulijst categoriecode", payload.milieulijst_categoriecode),
+        ("Geschatte investering (€)", f"{inv:.2f}"),
+        (
             "Geplande startdatum",
             payload.geplande_startdatum.isoformat()
             if payload.geplande_startdatum
             else None,
         ),
-        _email_row("Al een offerte?", "Ja" if payload.heeft_offerte else "Nee"),
-        _email_row(
+        ("Al een offerte?", "Ja" if payload.heeft_offerte else "Nee"),
+        (
             "Offertedatum",
             payload.offerte_datum.isoformat() if payload.offerte_datum else None,
         ),
-        _email_row(
+        (
             "Deadline RVO (indicatie +3 mnd)",
             m.deadline_indienen.isoformat() if m.deadline_indienen else None,
         ),
-        _email_row(
+        (
             "Geschatte MIA-aftrek (36%) (€)",
             f"{m.geschatte_subsidie:.2f}" if m.geschatte_subsidie else None,
         ),
-        _email_row(
-            "Vamil liquiditeit (indicatie 3%) (€)",
-            f"{vamil_indicatie:.2f}",
-        ),
-        _email_row("Contactpersoon", contact_naam),
-        _email_row("Telefoon", tel),
-        _email_row("Maatregel-ID", str(m.id)),
+        ("Vamil liquiditeit (indicatie 3%) (€)", f"{vamil_indicatie:.2f}"),
+        ("Contactpersoon", contact_naam),
+        ("Telefoon", tel),
+        ("Maatregel-ID", str(m.id)),
     ]
-    rows_html = "".join(rows)
-    for admin_to in _admin_notification_recipients(db):
-        send_admin_mia_vamil_intake_email(
-            to=admin_to,
-            subject=subject,
-            project_adres=project_adres,
-            rows_html=rows_html,
-            urgent=urgent,
-        )
+    email_service.notify_admins_new_wizard_maatregel(
+        db,
+        user=user,
+        project=project,
+        maatregel=m,
+        subsidie_type_label="MIA / Vamil",
+        wizard_rows=row_tuples,
+        urgent=urgent,
+    )
 
     return MaatregelOut.model_validate(m)
 
@@ -1110,73 +1217,59 @@ def create_dumava_aanvragen(
     for m in created:
         db.refresh(m)
 
-    project_adres = (
-        f"{project.straat} {project.huisnummer}, {project.postcode} {project.plaats}"
-    )
     totaal_inv = sum(float(i.investering_bedrag) for i in payload.items)
     totaal_sub = sum(float(m.geschatte_subsidie or 0) for m in created)
-    subject = f"[DUMAVA — prioriteit] Nieuwe intake — {project_adres}"
-
-    rows: List[str] = [
-        _email_row("Klant-e-mail", user.email),
-        _email_row("Organisatie-type", org_label),
-        _email_row("Contactpersoon", payload.contactpersoon_naam.strip()),
-        _email_row("Functie", functie_s),
-        _email_row("Telefoon", payload.telefoon.strip()),
-        _email_row(
+    common_tuples: List[tuple[str, Optional[str]]] = [
+        ("Klant-e-mail", user.email),
+        ("Organisatie-type", org_label),
+        ("Contactpersoon", payload.contactpersoon_naam.strip()),
+        ("Functie", functie_s),
+        ("Telefoon", payload.telefoon.strip()),
+        (
             "Eerder contact RVO",
             "Ja" if payload.rvo_contact_gehad else "Nee",
         ),
-        _email_row("Oppervlakte gebouw (m²)", f"{payload.oppervlakte_m2:g}"),
-        _email_row("Bouwjaar", str(payload.bouwjaar)),
-        _email_row("Energielabel", energie_line),
-        _email_row(
+        ("Oppervlakte gebouw (m²)", f"{payload.oppervlakte_m2:g}"),
+        ("Bouwjaar", str(payload.bouwjaar)),
+        ("Energielabel", energie_line),
+        (
             "EPA-maatwerkadvies aanwezig",
             "Ja" if payload.heeft_maatwerkadvies else "Nee",
         ),
-        _email_row(
-            "Totaal investering maatregelen (€)",
-            f"{totaal_inv:.2f}",
-        ),
-        _email_row(
+        ("Totaal investering maatregelen (€)", f"{totaal_inv:.2f}"),
+        (
             "Som geschatte DUMAVA (30%) (€)",
             f"{totaal_sub:.2f}" if totaal_sub else None,
         ),
     ]
     if totaal_inv > _DUMAVA_MAX_INVESTERING_PER_GEBOUW:
-        rows.append(
-            _email_row(
+        common_tuples.append(
+            (
                 "Let op",
                 "Totaalinvestering overschrijdt indicatief €1.500.000 per gebouw; "
                 "controleer subsidiabele kosten bij RVO.",
             )
         )
     for idx, m in enumerate(created):
-        if idx:
-            rows.append(
-                '<tr><td colspan="2" style="padding:8px 0;border-top:1px solid #e5e7eb;"></td></tr>'
-            )
         w_item = payload.items[idx]
         lab = _DUMAVA_MAATREGEL_KEY_LABELS[w_item.maatregel_key]
-        rows.append(_email_row("Maatregel", lab))
-        rows.append(
-            _email_row("Investering (€)", f"{w_item.investering_bedrag:.2f}")
-        )
-        rows.append(
-            _email_row(
+        m_rows = list(common_tuples)
+        m_rows.append(("Maatregel", lab))
+        m_rows.append(("Investering (€)", f"{w_item.investering_bedrag:.2f}"))
+        m_rows.append(
+            (
                 "Geschatte DUMAVA (€)",
                 f"{m.geschatte_subsidie:.2f}" if m.geschatte_subsidie else None,
             )
         )
-        rows.append(_email_row("Maatregel-ID", str(m.id)))
-
-    rows_html = "".join(rows)
-    for admin_to in _admin_notification_recipients(db):
-        send_admin_dumava_intake_email(
-            to=admin_to,
-            subject=subject,
-            project_adres=project_adres,
-            rows_html=rows_html,
+        m_rows.append(("Maatregel-ID", str(m.id)))
+        email_service.notify_admins_new_wizard_maatregel(
+            db,
+            user=user,
+            project=project,
+            maatregel=m,
+            subsidie_type_label="DUMAVA",
+            wizard_rows=m_rows,
         )
 
     return [MaatregelOut.model_validate(m) for m in created]
@@ -1269,6 +1362,7 @@ def update_maatregel(
     db: DbSession,
 ) -> MaatregelOut:
     m = _maatregel_or_403(db, maatregel_id, user)
+    old_status = m.status
 
     data = payload.model_dump(exclude_unset=True)
     # toegekende_subsidie is AAA-Lex only.
@@ -1285,6 +1379,13 @@ def update_maatregel(
         _auto_estimate_subsidie(m, overwrite=True)
     db.commit()
     db.refresh(m)
+    if _is_admin(user) and m.status != old_status:
+        email_service.notify_klant_maatregel_status_change(
+            db,
+            maatregel=m,
+            old_status=old_status,
+            new_status=m.status,
+        )
     return MaatregelOut.model_validate(m)
 
 

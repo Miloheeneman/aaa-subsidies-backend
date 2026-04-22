@@ -18,8 +18,9 @@ Three concerns live here:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, List, Optional, Sequence, Tuple
+from uuid import UUID
 
 from app.models.enums import (
     DeadlineStatus,
@@ -624,3 +625,147 @@ def get_matching_subsidies(project: object) -> List[SubsidieMatch]:
         if m is not None:
             results.append(m)
     return results
+
+
+def verplichte_documenten_telling(db: object, maatregel: object) -> tuple[int, int]:
+    """Aantal verplichte checklist-items vs. geüpload (per documenttype)."""
+    from sqlalchemy import select
+
+    from app.models.maatregel_document import MaatregelDocument
+
+    checklist = get_required_documents(maatregel.maatregel_type)
+    verplicht = [c for c in checklist if c.verplicht]
+    rows = (
+        db.execute(
+            select(MaatregelDocument.document_type).where(
+                MaatregelDocument.maatregel_id == maatregel.id
+            )
+        )
+        .scalars()
+        .all()
+    )
+    have = set(rows)
+    geupload = sum(1 for c in verplicht if c.document_type in have)
+    return len(verplicht), geupload
+
+
+def _document_types_from_verzoek_raw(raw: list) -> List[MaatregelDocumentType]:
+    out: List[MaatregelDocumentType] = []
+    for x in raw or []:
+        try:
+            out.append(MaatregelDocumentType(x))
+        except ValueError:
+            continue
+    return out
+
+
+def fulfilled_verzoek_document_types(
+    db: object,
+    *,
+    maatregel_id: UUID,
+    vz_created_at: datetime,
+    types: Sequence[MaatregelDocumentType],
+) -> set[MaatregelDocumentType]:
+    if not types:
+        return set()
+    from sqlalchemy import select
+
+    from app.models.maatregel_document import MaatregelDocument
+
+    rows = (
+        db.execute(
+            select(MaatregelDocument.document_type).where(
+                MaatregelDocument.maatregel_id == maatregel_id,
+                MaatregelDocument.created_at >= vz_created_at,
+                MaatregelDocument.document_type.in_(types),
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return set(rows)
+
+
+def open_upload_verzoek_rows_for_project(db: object, project_id: UUID) -> List[dict]:
+    """Actieve (niet verlopen, niet voltooid) uploadverzoeken voor klant-UI."""
+    from sqlalchemy import select
+
+    from app.models.maatregel import Maatregel
+    from app.models.upload_verzoek import UploadVerzoek
+
+    now = datetime.now(timezone.utc)
+    q = (
+        select(UploadVerzoek, Maatregel)
+        .join(Maatregel, UploadVerzoek.maatregel_id == Maatregel.id)
+        .where(
+            Maatregel.project_id == project_id,
+            UploadVerzoek.voltooid.is_(False),
+            UploadVerzoek.token_expires_at > now,
+        )
+    )
+    out: List[dict] = []
+    for vz, m in db.execute(q).all():
+        types = _document_types_from_verzoek_raw(list(vz.document_types or []))
+        total = len(types)
+        if total == 0:
+            continue
+        ful = fulfilled_verzoek_document_types(
+            db,
+            maatregel_id=m.id,
+            vz_created_at=vz.created_at,
+            types=types,
+        )
+        nog = len(set(types) - ful)
+        out.append(
+            {
+                "id": vz.id,
+                "maatregel_id": m.id,
+                "token": vz.token,
+                "token_expires_at": vz.token_expires_at,
+                "documenten_nog_nodig": nog,
+                "documenten_totaal": total,
+            }
+        )
+    return out
+
+
+def project_ids_with_open_upload_verzoek(
+    db: object, project_ids: List[UUID]
+) -> set[UUID]:
+    if not project_ids:
+        return set()
+    from sqlalchemy import select
+
+    from app.models.maatregel import Maatregel
+    from app.models.upload_verzoek import UploadVerzoek
+
+    now = datetime.now(timezone.utc)
+    rows = (
+        db.execute(
+            select(Maatregel.project_id)
+            .join(UploadVerzoek, UploadVerzoek.maatregel_id == Maatregel.id)
+            .where(
+                Maatregel.project_id.in_(project_ids),
+                UploadVerzoek.voltooid.is_(False),
+                UploadVerzoek.token_expires_at > now,
+            )
+            .distinct()
+        )
+        .scalars()
+        .all()
+    )
+    return set(rows)
+
+
+def maybe_complete_upload_verzoek(db: object, vz: object) -> None:
+    types = _document_types_from_verzoek_raw(list(vz.document_types or []))
+    if not types:
+        return
+    ful = fulfilled_verzoek_document_types(
+        db,
+        maatregel_id=vz.maatregel_id,
+        vz_created_at=vz.created_at,
+        types=types,
+    )
+    if set(types) <= ful:
+        vz.voltooid = True

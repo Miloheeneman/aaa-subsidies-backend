@@ -27,6 +27,10 @@ from app.models.aaa_lex_project import AAALexProject
 from app.models.project import Project
 from app.models.maatregel import Maatregel
 from app.models.maatregel_document import MaatregelDocument
+from app.models.admin_note import AdminMaatregelNote, AdminOrganisationNote
+from app.models.admin_notitie import AdminNotitie
+from app.models.upload_verzoek import UploadVerzoek
+from app.models.klant_notificatie import KlantNotificatie
 
 __all__ = [
     "AanvraagStatus",
@@ -56,4 +60,9 @@ __all__ = [
     "Project",
     "Maatregel",
     "MaatregelDocument",
+    "AdminOrganisationNote",
+    "AdminMaatregelNote",
+    "AdminNotitie",
+    "UploadVerzoek",
+    "KlantNotificatie",
 ]

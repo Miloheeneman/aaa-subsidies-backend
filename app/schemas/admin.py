@@ -85,7 +85,12 @@ class KlantSummary(BaseModel):
     kvk_number: Optional[str] = None
     primary_contact_name: Optional[str] = None
     primary_contact_email: Optional[str] = None
+    primary_phone: Optional[str] = None
+    subscription_plan: Optional[str] = None
     aanvraag_count: int
+    project_count: int = 0
+    active_maatregel_count: int = 0
+    critical_maatregel_count: int = 0
     totaal_geschatte_subsidie: Decimal
     totaal_toegekende_subsidie: Decimal
     created_at: datetime
@@ -142,3 +147,5 @@ class DeadlineRunResponse(BaseModel):
     expired: int
     skipped_recent: int = 0
     skipped_no_contact: int = 0
+    maatregelen_checked: int = 0
+    maatregel_admin_deadline_mails: int = 0

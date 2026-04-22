@@ -7,10 +7,10 @@ the chosen regeling.
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, datetime
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import Boolean, Date, Enum, Float, ForeignKey, String, Text
+from sqlalchemy import Boolean, Date, DateTime, Enum, Float, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -131,6 +131,17 @@ class Maatregel(UUIDPKMixin, TimestampMixin, Base):
         ),
         nullable=True,
         index=True,
+    )
+
+    # Admin deadline-waarschuwingen (Resend naar subsidies@…)
+    deadline_admin_mail_30_sent_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    deadline_admin_mail_14_sent_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    deadline_admin_mail_7_sent_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     # --- Relationships ----------------------------------------------------

@@ -9,7 +9,7 @@ from typing import Annotated, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DbSession, require_admin
@@ -17,14 +17,18 @@ from app.core.config import settings
 from app.models import (
     AanvraagDocument,
     InstallateurLead,
+    Maatregel,
     Organisation,
+    Project,
     RegelingConfig,
     SubsidieAanvraag,
     User,
 )
 from app.models.enums import (
     AanvraagStatus,
+    DeadlineStatus,
     LeadStatus,
+    MaatregelStatus,
     OrganisationType,
     RegelingCode,
 )
@@ -42,7 +46,10 @@ from app.schemas.admin import (
     StatusUpdateRequest,
 )
 from app.schemas.documenten import DocumentOut
-from app.services.deadline_service import check_all_deadlines
+from app.services.deadline_service import (
+    check_all_deadlines,
+    check_maatregel_deadlines_admin,
+)
 from app.services.email import (
     send_aanvraag_afgewezen_email,
     send_aanvraag_goedgekeurd_email,
@@ -406,17 +413,36 @@ def verify_document(document_id: UUID, db: DbSession) -> DocumentOut:
     response_model=list[KlantSummary],
     summary="Overzicht klantorganisaties",
 )
-def list_klanten(db: DbSession) -> list[KlantSummary]:
-    rows = (
-        db.execute(
-            select(Organisation)
-            .where(Organisation.type == OrganisationType.klant)
-            .options(selectinload(Organisation.users))
-            .order_by(Organisation.created_at.desc())
-        )
-        .scalars()
-        .all()
+def list_klanten(
+    db: DbSession,
+    q: Annotated[
+        Optional[str],
+        Query(
+            default=None,
+            description="Zoek op organisatienaam of e-mail van een gebruiker",
+        ),
+    ] = None,
+) -> list[KlantSummary]:
+    stmt = (
+        select(Organisation)
+        .where(Organisation.type == OrganisationType.klant)
+        .options(selectinload(Organisation.users))
+        .order_by(Organisation.created_at.desc())
     )
+    if q and q.strip():
+        term = f"%{q.strip()}%"
+        stmt = stmt.where(
+            or_(
+                Organisation.name.ilike(term),
+                Organisation.id.in_(
+                    select(User.organisation_id).where(
+                        User.organisation_id.is_not(None),
+                        User.email.ilike(term),
+                    )
+                ),
+            )
+        )
+    rows = db.execute(stmt).scalars().all()
 
     out: list[KlantSummary] = []
     for org in rows:
@@ -429,6 +455,50 @@ def list_klanten(db: DbSession) -> list[KlantSummary]:
         ).one()
         primary = (
             min(org.users, key=lambda u: u.created_at) if org.users else None
+        )
+        project_count = int(
+            db.execute(
+                select(func.count())
+                .select_from(Project)
+                .where(
+                    Project.organisation_id == org.id,
+                    Project.is_deleted.is_(False),
+                )
+            ).scalar_one()
+        )
+        active_maatregel_count = int(
+            db.execute(
+                select(func.count())
+                .select_from(Maatregel)
+                .join(Project, Maatregel.project_id == Project.id)
+                .where(
+                    Project.organisation_id == org.id,
+                    Project.is_deleted.is_(False),
+                    Maatregel.status.notin_(
+                        [MaatregelStatus.goedgekeurd, MaatregelStatus.afgewezen]
+                    ),
+                )
+            ).scalar_one()
+        )
+        critical_maatregel_count = int(
+            db.execute(
+                select(func.count())
+                .select_from(Maatregel)
+                .join(Project, Maatregel.project_id == Project.id)
+                .where(
+                    Project.organisation_id == org.id,
+                    Project.is_deleted.is_(False),
+                    Maatregel.deadline_status.in_(
+                        [DeadlineStatus.kritiek, DeadlineStatus.verlopen]
+                    ),
+                    Maatregel.status.notin_(
+                        [MaatregelStatus.goedgekeurd, MaatregelStatus.afgewezen]
+                    ),
+                )
+            ).scalar_one()
+        )
+        sub_plan = org.subscription_plan or (
+            primary.subscription_plan if primary else None
         )
         out.append(
             KlantSummary(
@@ -444,7 +514,12 @@ def list_klanten(db: DbSession) -> list[KlantSummary]:
                 if primary
                 else None,
                 primary_contact_email=primary.email if primary else None,
+                primary_phone=primary.phone if primary else None,
+                subscription_plan=sub_plan,
                 aanvraag_count=int(agg[0]),
+                project_count=project_count,
+                active_maatregel_count=active_maatregel_count,
+                critical_maatregel_count=critical_maatregel_count,
                 totaal_geschatte_subsidie=_quantize(_to_decimal(agg[1])),
                 totaal_toegekende_subsidie=_quantize(_to_decimal(agg[2])),
                 created_at=org.created_at,
@@ -586,10 +661,13 @@ def update_regeling(
 )
 def run_deadline_check(db: DbSession) -> DeadlineRunResponse:
     result = check_all_deadlines(db)
+    mres = check_maatregel_deadlines_admin(db)
     return DeadlineRunResponse(
         checked=result.checked,
         warnings_sent=result.warnings_sent,
         expired=result.expired,
         skipped_recent=result.skipped_recent,
         skipped_no_contact=result.skipped_no_contact,
+        maatregelen_checked=mres.checked,
+        maatregel_admin_deadline_mails=mres.emails_sent,
     )

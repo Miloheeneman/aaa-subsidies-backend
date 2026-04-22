@@ -4,9 +4,8 @@ import html
 import logging
 from typing import Optional
 
-import resend
-
 from app.core.config import settings
+from app.services.email_service import deliver_resend_email
 
 logger = logging.getLogger(__name__)
 
@@ -65,25 +64,7 @@ def _button(label: str, url: str) -> str:
 
 def send_email(*, to: str, subject: str, html: str) -> None:
     """Send an email via Resend. Logs (does not raise) if not configured."""
-    if not settings.RESEND_API_KEY:
-        logger.warning(
-            "RESEND_API_KEY not set; skipping email to %s subject=%r", to, subject
-        )
-        return
-
-    resend.api_key = settings.RESEND_API_KEY
-    from_addr = f"{settings.RESEND_FROM_NAME} <{settings.RESEND_FROM_EMAIL}>"
-    try:
-        resend.Emails.send(
-            {
-                "from": from_addr,
-                "to": [to],
-                "subject": subject,
-                "html": html,
-            }
-        )
-    except Exception:
-        logger.exception("Failed to send email to %s", to)
+    deliver_resend_email(to=to, subject=subject, html=html)
 
 
 def send_verification_email(

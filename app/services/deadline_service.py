@@ -14,14 +14,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import and_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.config import settings
-from app.models import SubsidieAanvraag
+from app.models import Maatregel, Project, SubsidieAanvraag
+from app.models.enums import MaatregelStatus
 from app.models.enums import AanvraagStatus
 from app.services.email import (
     send_deadline_7_dagen_email,
@@ -170,3 +171,107 @@ def check_all_deadlines(
 
     db.commit()
     return result
+
+
+@dataclass
+class MaatregelAdminDeadlineResult:
+    checked: int = 0
+    emails_sent: int = 0
+
+
+def check_maatregel_deadlines_admin(
+    db: Session, *, today: Optional[date] = None
+) -> MaatregelAdminDeadlineResult:
+    """Stuur TEMPLATE 4 naar admins op 30 / 14 / 7 dagen vóór maatregel-deadline."""
+    from app.services.email_service import send_template_4_admin_deadline_warning
+    from app.services.projecten_service import verplichte_documenten_telling
+
+    today = today or date.today()
+    now = datetime.now(timezone.utc)
+    res = MaatregelAdminDeadlineResult()
+
+    rows = (
+        db.execute(
+            select(Maatregel)
+            .join(Project, Maatregel.project_id == Project.id)
+            .where(Project.is_deleted.is_(False))
+            .where(Maatregel.deadline_indienen.is_not(None))
+            .where(
+                Maatregel.status.notin_(
+                    [MaatregelStatus.goedgekeurd, MaatregelStatus.afgewezen]
+                )
+            )
+            .options(
+                selectinload(Maatregel.project).selectinload(Project.organisation),
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    for m in rows:
+        res.checked += 1
+        if m.deadline_indienen is None:
+            continue
+        d = (m.deadline_indienen - today).days
+        project = m.project
+        if project is None:
+            continue
+        org = project.organisation
+        klant_naam = org.name if org else "—"
+        reg = m.regeling_code.value if m.regeling_code else "—"
+        adres = (
+            f"{project.straat} {project.huisnummer}, {project.postcode} {project.plaats}"
+        )
+        tot, up = verplichte_documenten_telling(db, m)
+        status_line = f"{up}/{tot} verplichte documenten aanwezig"
+        base = (settings.FRONTEND_URL or "").rstrip("/")
+        admin_url = f"{base}/admin/projecten/{project.id}/maatregelen/{m.id}"
+
+        try:
+            if d == 30 and m.deadline_admin_mail_30_sent_at is None:
+                send_template_4_admin_deadline_warning(
+                    db,
+                    dagen_over=30,
+                    klant_naam=klant_naam,
+                    subsidie_type=reg,
+                    project_adres=adres,
+                    deadline_datum=m.deadline_indienen,
+                    dossier_status_line=status_line,
+                    admin_dossier_url=admin_url,
+                )
+                m.deadline_admin_mail_30_sent_at = now
+                res.emails_sent += 1
+            elif d == 14 and m.deadline_admin_mail_14_sent_at is None:
+                send_template_4_admin_deadline_warning(
+                    db,
+                    dagen_over=14,
+                    klant_naam=klant_naam,
+                    subsidie_type=reg,
+                    project_adres=adres,
+                    deadline_datum=m.deadline_indienen,
+                    dossier_status_line=status_line,
+                    admin_dossier_url=admin_url,
+                )
+                m.deadline_admin_mail_14_sent_at = now
+                res.emails_sent += 1
+            elif d == 7 and m.deadline_admin_mail_7_sent_at is None:
+                send_template_4_admin_deadline_warning(
+                    db,
+                    dagen_over=7,
+                    klant_naam=klant_naam,
+                    subsidie_type=reg,
+                    project_adres=adres,
+                    deadline_datum=m.deadline_indienen,
+                    dossier_status_line=status_line,
+                    admin_dossier_url=admin_url,
+                )
+                m.deadline_admin_mail_7_sent_at = now
+                res.emails_sent += 1
+        except Exception:  # pragma: no cover
+            logger.exception(
+                "Failed maatregel admin deadline mail for maatregel %s", m.id
+            )
+
+    db.commit()
+    return res

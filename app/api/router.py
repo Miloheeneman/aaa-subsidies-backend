@@ -4,10 +4,12 @@ from app.api.routes import (
     aaa_lex,
     aanvragen,
     admin,
+    admin_portal,
     auth,
     documenten,
     health,
     installateur,
+    notifications,
     projecten,
     stripe_routes,
     subscriptions,
@@ -23,8 +25,10 @@ api_router.include_router(subsidiecheck.router)
 api_router.include_router(aanvragen.router)
 api_router.include_router(documenten.router)
 api_router.include_router(admin.router)
+api_router.include_router(admin_portal.router)
 api_router.include_router(aaa_lex.router)
 api_router.include_router(installateur.router)
 api_router.include_router(stripe_routes.router)
 api_router.include_router(subscriptions.router)
 api_router.include_router(projecten.router)
+api_router.include_router(notifications.router)

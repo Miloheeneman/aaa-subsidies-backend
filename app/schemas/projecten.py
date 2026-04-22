@@ -72,6 +72,19 @@ class MaatregelShort(BaseModel):
     deadline_status: Optional[DeadlineStatus] = None
 
 
+class OpenUploadVerzoekOut(BaseModel):
+    """Actief uploadverzoek (token-link) voor klantprojectpagina."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    maatregel_id: UUID
+    token: str
+    token_expires_at: datetime
+    documenten_nog_nodig: int
+    documenten_totaal: int
+
+
 class ProjectOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -97,6 +110,8 @@ class ProjectOut(BaseModel):
     updated_at: datetime
 
     # Afgeleid, ingevuld door de route
+    totaal_geschatte_subsidie: float = 0
+    heeft_open_upload_verzoek: bool = False
     aantal_maatregelen: int = 0
     worst_deadline_status: Optional[DeadlineStatus] = None
     organisation_name: Optional[str] = None  # alleen gevuld voor admins
@@ -110,6 +125,7 @@ class ProjectListResponse(BaseModel):
 
 class ProjectDetailResponse(ProjectOut):
     maatregelen: List[MaatregelShort] = []
+    open_upload_verzoeken: List[OpenUploadVerzoekOut] = []
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +499,25 @@ class DumavaAanvraagCreate(BaseModel):
                 "zonnepanelen of isolatie)"
             )
         return self
+
+
+class PublicUploadDocItemOut(BaseModel):
+    document_type: str
+    label: str
+    uitleg: str
+
+
+class PublicUploadMetaOut(BaseModel):
+    """Publieke upload-pagina (token in e-maillink, geen login)."""
+
+    project_id: UUID
+    maatregel_id: UUID
+    subsidie_type: str
+    project_adres: str
+    bericht: Optional[str] = None
+    documenten: List[PublicUploadDocItemOut]
+    token_expires_at: datetime
+    deadline_indienen: Optional[date] = None
 
 
 class IsdeIsolatieAanvraagCreate(BaseModel):
