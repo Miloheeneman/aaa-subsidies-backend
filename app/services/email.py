@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import logging
 from typing import Optional
 
@@ -379,4 +380,35 @@ def send_aaa_lex_match_email(
         to=to,
         subject="Uw subsidiemogelijkheden op basis van de AAA-Lex meting",
         html=_wrap("Subsidiekansen voor uw pand", body),
+    )
+
+
+def send_admin_isde_warmtepomp_intake_email(
+    *,
+    to: str,
+    subject: str,
+    pand_adres: str,
+    rows_html: str,
+) -> None:
+    """Admin-notificatie: nieuwe ISDE warmtepomp-intake via klantwizard."""
+    body = f"""\
+<p style="margin:0 0 12px 0;">
+  Er is een nieuwe ISDE warmtepomp-aanvraag binnengekomen via AAA-Subsidies.
+</p>
+<p style="margin:0 0 12px 0;">
+  <strong>Pand:</strong> {html.escape(pand_adres)}
+</p>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0"
+       style="margin:8px 0 0 0;width:100%;font-size:14px;color:#374151;">
+  {rows_html}
+</table>
+<p style="margin:20px 0 0 0;font-size:13px;color:#4b5563;">
+  Log in op het admin-dashboard om het dossier te bekijken en verder te
+  begeleiden.
+</p>
+"""
+    send_email(
+        to=to,
+        subject=subject,
+        html=_wrap("Nieuwe ISDE warmtepomp aanvraag", body),
     )

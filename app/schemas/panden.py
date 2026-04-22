@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -261,6 +261,29 @@ class SubsidieMatchResponse(BaseModel):
     pand_id: UUID
     eligible: List[SubsidieMatchOut]
     niet_eligible: List[SubsidieMatchOut]
+
+
+class IsdeWarmtepompAanvraagCreate(BaseModel):
+    """Payload voor de ISDE warmtepomp intake-wizard (klant)."""
+
+    situatie: Literal["geinstalleerd", "orienteren"]
+    warmtepomp_subtype: Literal[
+        "warmtepomp_lucht_water",
+        "warmtepomp_water_water",
+        "warmtepomp_hybride",
+    ]
+    apparaat_merk: Optional[str] = Field(default=None, max_length=128)
+    apparaat_typenummer: Optional[str] = Field(default=None, max_length=128)
+    apparaat_meldcode: Optional[str] = Field(default=None, max_length=128)
+
+    installateur_naam: str = Field(min_length=1, max_length=255)
+    installateur_kvk: Optional[str] = Field(default=None, max_length=32)
+    installateur_gecertificeerd: bool = False
+    installatie_datum: Optional[date] = None
+
+    investering_bedrag: Optional[float] = Field(default=None, ge=0)
+    heeft_offerte: bool = False
+    offerte_datum: Optional[date] = None
 
 
 PandListResponse.model_rebuild()

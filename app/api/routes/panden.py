@@ -10,6 +10,7 @@ kleur kan tonen.
 """
 from __future__ import annotations
 
+import html
 import logging
 from datetime import datetime, timezone
 from typing import Annotated, List, Optional
@@ -20,6 +21,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import CurrentUser, DbSession, require_verified
+from app.core.config import settings
 from app.models import (
     Maatregel,
     MaatregelDocument,
@@ -32,6 +34,7 @@ from app.models.enums import (
     MaatregelDocumentType,
     MaatregelStatus,
     MaatregelType,
+    RegelingCode,
     UserRole,
 )
 from app.schemas.panden import (
@@ -48,12 +51,14 @@ from app.schemas.panden import (
     PandOut,
     PandUpdate,
     QuotaInfo,
+    IsdeWarmtepompAanvraagCreate,
     SubsidieMatchOut,
     SubsidieMatchResponse,
     UploadUrlRequest,
     UploadUrlResponse,
 )
 from app.services import r2_storage
+from app.services.email import send_admin_isde_warmtepomp_intake_email
 from app.services.panden_service import (
     allowed_document_types,
     calculate_deadline,
@@ -105,6 +110,17 @@ def _maatregel_or_403(
         )
     _pand_or_403(db, m.pand_id, user)  # raises on access denied
     return m
+
+
+def _admin_notification_recipients(db: Session) -> List[str]:
+    """E-mailadressen voor admin-notificaties (Resend)."""
+    raw = (settings.ADMIN_NOTIFICATION_EMAIL or "").strip()
+    if raw:
+        return [e.strip() for e in raw.split(",") if e.strip()]
+    rows = db.execute(
+        select(User.email).where(User.role == UserRole.admin)
+    ).scalars().all()
+    return sorted({e for e in rows if e})
 
 
 def _quota_info(db: Session, user: User) -> QuotaInfo:
@@ -402,6 +418,159 @@ def get_subsidies_voor_pand(
         eligible=eligible,
         niet_eligible=niet_eligible,
     )
+
+
+_ISDE_WP_SUBTYPE_LABELS: dict[MaatregelType, str] = {
+    MaatregelType.warmtepomp_lucht_water: "Lucht/water warmtepomp",
+    MaatregelType.warmtepomp_water_water: "Water/water warmtepomp",
+    MaatregelType.warmtepomp_hybride: "Hybride warmtepomp",
+}
+
+
+def _email_row(label: str, value: object) -> str:
+    if value is None or value == "":
+        v_html = "—"
+    else:
+        v_html = html.escape(str(value))
+    return (
+        "<tr>"
+        f'<td style="padding:6px 12px 6px 0;font-weight:600;color:#6b7280;'
+        f'vertical-align:top;">{html.escape(label)}</td>'
+        f'<td style="padding:6px 0;">{v_html}</td>'
+        "</tr>"
+    )
+
+
+@router.post(
+    "/panden/{pand_id}/aanvragen/isde-warmtepomp",
+    response_model=MaatregelOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_isde_warmtepomp_aanvraag(
+    pand_id: UUID,
+    payload: IsdeWarmtepompAanvraagCreate,
+    user: VerifiedUser,
+    db: DbSession,
+) -> MaatregelOut:
+    """Wizard-submit: sla ISDE warmtepomp-intake op als nieuwe maatregel."""
+    pand = _pand_or_403(db, pand_id, user)
+
+    m_type = MaatregelType(payload.warmtepomp_subtype)
+    if m_type not in _ISDE_WP_SUBTYPE_LABELS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Ongeldig warmtepomp-type voor deze wizard",
+        )
+
+    m_status = (
+        MaatregelStatus.gepland
+        if payload.situatie == "geinstalleerd"
+        else MaatregelStatus.orientatie
+    )
+    offerte_datum = payload.offerte_datum if payload.heeft_offerte else None
+
+    def _strip_opt(s: Optional[str]) -> Optional[str]:
+        if s is None:
+            return None
+        t = s.strip()
+        return t or None
+
+    m = Maatregel(
+        pand_id=pand.id,
+        created_by=user.id,
+        maatregel_type=m_type,
+        omschrijving=(
+            "ISDE warmtepomp — intake via wizard ("
+            + (
+                "reeds geïnstalleerd"
+                if payload.situatie == "geinstalleerd"
+                else "oriëntatie"
+            )
+            + ")"
+        ),
+        status=m_status,
+        apparaat_merk=_strip_opt(payload.apparaat_merk),
+        apparaat_typenummer=_strip_opt(payload.apparaat_typenummer),
+        apparaat_meldcode=_strip_opt(payload.apparaat_meldcode),
+        installateur_naam=payload.installateur_naam.strip(),
+        installateur_kvk=_strip_opt(payload.installateur_kvk),
+        installateur_gecertificeerd=bool(payload.installateur_gecertificeerd),
+        installatie_datum=payload.installatie_datum,
+        offerte_datum=offerte_datum,
+        investering_bedrag=payload.investering_bedrag,
+        regeling_code=RegelingCode.ISDE,
+    )
+    _recalc_deadline(m)
+    _auto_estimate_subsidie(m)
+    db.add(m)
+    db.commit()
+    db.refresh(m)
+
+    pand_adres = (
+        f"{pand.straat} {pand.huisnummer}, {pand.postcode} {pand.plaats}"
+    )
+    subject = f"Nieuwe ISDE warmtepomp aanvraag — {pand_adres}"
+
+    situatie_txt = (
+        "Ja, al geïnstalleerd"
+        if payload.situatie == "geinstalleerd"
+        else "Nog aan het oriënteren"
+    )
+    rows = [
+        _email_row("Klant-e-mail", user.email),
+        _email_row("Situatie", situatie_txt),
+        _email_row(
+            "Type warmtepomp",
+            _ISDE_WP_SUBTYPE_LABELS.get(m_type, m_type.value),
+        ),
+        _email_row("Merk", m.apparaat_merk),
+        _email_row("Typenummer", m.apparaat_typenummer),
+        _email_row("Meldcode", m.apparaat_meldcode),
+        _email_row("Installateur", m.installateur_naam),
+        _email_row("KvK installateur", m.installateur_kvk),
+        _email_row(
+            "Gecertificeerd",
+            "Ja" if m.installateur_gecertificeerd else "Nee",
+        ),
+        _email_row(
+            "Installatiedatum",
+            m.installatie_datum.isoformat() if m.installatie_datum else None,
+        ),
+        _email_row(
+            "Geschatte investering (€)",
+            f"{m.investering_bedrag:.2f}" if m.investering_bedrag is not None else None,
+        ),
+        _email_row(
+            "Offerte",
+            "Ja"
+            if payload.heeft_offerte
+            else "Nee",
+        ),
+        _email_row(
+            "Offertedatum",
+            m.offerte_datum.isoformat() if m.offerte_datum else None,
+        ),
+        _email_row(
+            "Geschatte subsidie (€)",
+            f"{m.geschatte_subsidie:.2f}" if m.geschatte_subsidie is not None else None,
+        ),
+        _email_row(
+            "Deadline indienen",
+            m.deadline_indienen.isoformat() if m.deadline_indienen else None,
+        ),
+        _email_row("Maatregel-ID", str(m.id)),
+    ]
+    rows_html = "".join(rows)
+
+    for admin_to in _admin_notification_recipients(db):
+        send_admin_isde_warmtepomp_intake_email(
+            to=admin_to,
+            subject=subject,
+            pand_adres=pand_adres,
+            rows_html=rows_html,
+        )
+
+    return MaatregelOut.model_validate(m)
 
 
 # ---------------------------------------------------------------------------
