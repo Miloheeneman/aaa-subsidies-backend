@@ -1,7 +1,7 @@
-"""Plan enforcement for the panden module (STAP 9).
+"""Plan enforcement for the projecten module (STAP 9).
 
 Reads the per-user subscription_plan (see migratie 0005) and translates
-it to a hard limit on ``Pand`` rows. Admins bypass all limits.
+it to a hard limit on ``Project`` rows. Admins bypass all limits.
 """
 from __future__ import annotations
 
@@ -11,12 +11,12 @@ from typing import Optional
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.models import Pand, User
-from app.models.enums import PAND_LIMIT_PER_PLAN, UserRole
+from app.models import Project, User
+from app.models.enums import PROJECT_LIMIT_PER_PLAN, UserRole
 
 
 @dataclass(frozen=True)
-class PandQuota:
+class ProjectQuota:
     plan: str
     limit: Optional[int]  # None means unlimited
     used: int
@@ -36,34 +36,34 @@ class PandQuota:
 
 def _effective_plan(user: User) -> str:
     plan = (user.subscription_plan or "gratis").lower()
-    if plan not in PAND_LIMIT_PER_PLAN:
+    if plan not in PROJECT_LIMIT_PER_PLAN:
         # Unknown plan string → fall back to the most restrictive tier
         # so a data-glitch never accidentally grants unlimited access.
         return "gratis"
     return plan
 
 
-def count_panden_for_user(db: Session, user: User) -> int:
-    """Count non-deleted panden owned by the user's organisation.
+def count_projecten_for_user(db: Session, user: User) -> int:
+    """Count non-deleted projecten owned by the user's organisation.
 
-    Klanten create panden under their org; panden created by org
+    Klanten create projecten under their org; projecten created by org
     colleagues count against the shared quota. This matches the
-    "Starter 2 users / 30 panden" wording on the pricing page.
+    "Starter 2 users / 30 projecten" wording on the pricing page.
     """
     if user.organisation_id is None:
         return 0
     stmt = (
-        select(func.count(Pand.id))
-        .where(Pand.organisation_id == user.organisation_id)
-        .where(Pand.is_deleted.is_(False))
+        select(func.count(Project.id))
+        .where(Project.organisation_id == user.organisation_id)
+        .where(Project.is_deleted.is_(False))
     )
     return int(db.execute(stmt).scalar_one())
 
 
-def get_quota(db: Session, user: User) -> PandQuota:
+def get_quota(db: Session, user: User) -> ProjectQuota:
     if user.role == UserRole.admin:
-        return PandQuota(plan="admin", limit=None, used=0)
+        return ProjectQuota(plan="admin", limit=None, used=0)
     plan = _effective_plan(user)
-    limit = PAND_LIMIT_PER_PLAN[plan]
-    used = count_panden_for_user(db, user)
-    return PandQuota(plan=plan, limit=limit, used=used)
+    limit = PROJECT_LIMIT_PER_PLAN[plan]
+    used = count_projecten_for_user(db, user)
+    return ProjectQuota(plan=plan, limit=limit, used=used)

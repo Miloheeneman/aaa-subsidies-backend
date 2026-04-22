@@ -89,9 +89,9 @@ class SubscriptionPlan(str, enum.Enum):
 PAID_PLANS = frozenset({SubscriptionPlan.starter.value, SubscriptionPlan.pro.value})
 
 
-# Hard caps per plan for the panden module. None = unlimited.
+# Hard caps per plan for the projecten module. None = unlimited.
 # Admins bypass this check entirely (see app.services.plan_service).
-PAND_LIMIT_PER_PLAN: dict[str, int | None] = {
+PROJECT_LIMIT_PER_PLAN: dict[str, int | None] = {
     SubscriptionPlan.gratis.value: 3,
     SubscriptionPlan.starter.value: 30,
     SubscriptionPlan.pro.value: 100,
@@ -100,11 +100,11 @@ PAND_LIMIT_PER_PLAN: dict[str, int | None] = {
 
 
 # ---------------------------------------------------------------------------
-# Panden module (STAP 9)
+# Projecten module (STAP 9)
 # ---------------------------------------------------------------------------
 
 
-class PandType(str, enum.Enum):
+class ProjectType(str, enum.Enum):
     woning = "woning"
     appartement = "appartement"
     kantoor = "kantoor"

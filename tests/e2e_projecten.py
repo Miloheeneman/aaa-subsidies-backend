@@ -1,16 +1,16 @@
-"""Live smoke test for the panden module (STAP 9).
+"""Live smoke test for the projecten module (STAP 9).
 
 Exercises the full klant flow end-to-end:
 
 1. Register + verify a klant (defaults to plan=gratis, limit=3).
-2. Create a pand; bouwjaar is required.
+2. Create a project; bouwjaar is required.
 3. Add a warmtepomp maatregel with installatie_datum; backend auto-fills
    deadline fields.
 4. Fetch checklist → all ISDE-verplichte documenten zijn aanwezig als
    item, nog niets geüpload, compleet=False.
 5. Upload a factuur (presign + confirm) → compleet-teller loopt op.
 6. Admin verifieert het document → geverifieerd flag omhoog.
-7. Maak 3 panden → vierde geeft 403 met PLAN_LIMIT_REACHED.
+7. Maak 3 projecten → vierde geeft 403 met PLAN_LIMIT_REACHED.
 """
 from __future__ import annotations
 
@@ -53,9 +53,9 @@ def _register_and_verify(client: httpx.Client, email: str) -> tuple[str, str]:
             json={
                 "email": email,
                 "password": "Welkom1234!",
-                "first_name": "Pand",
+                "first_name": "Project",
                 "last_name": "Tester",
-                "organisation_name": "Panden BV",
+                "organisation_name": "Projecten BV",
             },
         ),
         201,
@@ -91,39 +91,39 @@ def main() -> None:
     token, _ = _register_and_verify(client, klant_email)
     H = {"Authorization": f"Bearer {token}"}
 
-    # --- 1. create pand ------------------------------------------------
+    # --- 1. create project ------------------------------------------------
     body = {
         "straat": "Hoofdstraat",
         "huisnummer": "12A",
         "postcode": "1234 AB",
         "plaats": "Zoetermeer",
         "bouwjaar": 1970,
-        "pand_type": "woning",
+        "project_type": "woning",
         "eigenaar_type": "eigenaar_bewoner",
     }
-    pand = _ok(client.post("/panden", json=body, headers=H), 201)
-    assert pand["bouwjaar"] == 1970
-    assert pand["aantal_maatregelen"] == 0
-    pand_id = pand["id"]
-    print("create pand OK")
+    proj = _ok(client.post("/projecten", json=body, headers=H), 201)
+    assert proj["bouwjaar"] == 1970
+    assert proj["aantal_maatregelen"] == 0
+    project_id = proj["id"]
+    print("create project OK")
 
     # bouwjaar verplicht: zonder => 422
     bad = dict(body)
     bad.pop("bouwjaar")
-    r = client.post("/panden", json=bad, headers=H)
+    r = client.post("/projecten", json=bad, headers=H)
     assert r.status_code == 422, r.text
     print("bouwjaar verplicht -> 422 OK")
 
     # --- 2. list + detail ---------------------------------------------
-    lst = _ok(client.get("/panden", headers=H))
+    lst = _ok(client.get("/projecten", headers=H))
     assert lst["totaal"] == 1
     assert lst["quota"]["plan"] == "gratis"
     assert lst["quota"]["limit"] == 3
     assert lst["quota"]["used"] == 1
 
-    detail = _ok(client.get(f"/panden/{pand_id}", headers=H))
+    detail = _ok(client.get(f"/projecten/{project_id}", headers=H))
     assert detail["maatregelen"] == []
-    print("list + detail pand OK")
+    print("list + detail project OK")
 
     # --- 3. create maatregel (warmtepomp + installatie_datum) ---------
     m_body = {
@@ -134,7 +134,7 @@ def main() -> None:
         "investering_bedrag": 9500,
     }
     m = _ok(
-        client.post(f"/panden/{pand_id}/maatregelen", json=m_body, headers=H),
+        client.post(f"/projecten/{project_id}/maatregelen", json=m_body, headers=H),
         201,
     )
     assert m["maatregel_type"] == "warmtepomp_lucht_water"
@@ -218,29 +218,29 @@ def main() -> None:
     assert factuur["geverifieerd"] is True
     print("admin verifieert document OK")
 
-    # Admin ziet alle panden
-    all_panden = _ok(client.get("/panden", headers=A))
-    assert all_panden["totaal"] >= 1
-    assert all_panden["quota"]["plan"] == "admin"
-    print("admin ziet alle panden OK")
+    # Admin ziet alle projecten
+    all_projects = _ok(client.get("/projecten", headers=A))
+    assert all_projects["totaal"] >= 1
+    assert all_projects["quota"]["plan"] == "admin"
+    print("admin ziet alle projecten OK")
 
     # Kritieke deadlines widget (max_dagen groot genoeg om iets te vinden)
     widget = _ok(
         client.get(
-            "/admin/panden/kritieke-deadlines?max_dagen=99999", headers=A
+            "/admin/projecten/kritieke-deadlines?max_dagen=99999", headers=A
         )
     )
     assert isinstance(widget, list)
     print("kritieke-deadlines widget bereikbaar OK")
 
     # --- 7. plan-limit --------------------------------------------
-    # Gratis plan = 3 panden. We hebben er al 1 — nog 2 erbij = ok.
+    # Gratis plan = 3 projecten. We hebben er al 1 — nog 2 erbij = ok.
     for i in range(2):
         body2 = dict(body, straat=f"Bijstraat {i}")
-        _ok(client.post("/panden", json=body2, headers=H), 201)
+        _ok(client.post("/projecten", json=body2, headers=H), 201)
 
     # Vierde → 403 PLAN_LIMIT_REACHED
-    r = client.post("/panden", json=body, headers=H)
+    r = client.post("/projecten", json=body, headers=H)
     assert r.status_code == 403, r.text
     detail = r.json()["detail"]
     assert detail["code"] == "PLAN_LIMIT_REACHED"
@@ -249,13 +249,13 @@ def main() -> None:
     print("plan-limit enforcement (gratis=3) OK")
 
     # --- 8. soft-delete -------------------------------------------
-    _ok(client.delete(f"/panden/{pand_id}", headers=H), 204)
-    lst = _ok(client.get("/panden", headers=H))
-    assert all(p["id"] != pand_id for p in lst["items"])
-    assert lst["quota"]["used"] == 2  # 2 overgebleven actieve panden
+    _ok(client.delete(f"/projecten/{project_id}", headers=H), 204)
+    lst = _ok(client.get("/projecten", headers=H))
+    assert all(p["id"] != project_id for p in lst["items"])
+    assert lst["quota"]["used"] == 2  # 2 overgebleven actieve projecten
     print("soft-delete + quota herberekend OK")
 
-    print("\nAll panden tests passed")
+    print("\nAll projecten tests passed")
 
 
 if __name__ == "__main__":

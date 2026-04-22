@@ -12,7 +12,7 @@ from app.models.enums import (
     MaatregelStatus,
     MaatregelType,
     OrganisationType,
-    PandType,
+    ProjectType,
     RegelingCode,
     TypeAanvrager,
     UserRole,
@@ -24,7 +24,7 @@ from app.models.aanvraag_document import AanvraagDocument
 from app.models.installateur_lead import InstallateurLead
 from app.models.regelingen_config import RegelingConfig
 from app.models.aaa_lex_project import AAALexProject
-from app.models.pand import Pand
+from app.models.project import Project
 from app.models.maatregel import Maatregel
 from app.models.maatregel_document import MaatregelDocument
 
@@ -42,7 +42,7 @@ __all__ = [
     "MaatregelStatus",
     "MaatregelType",
     "OrganisationType",
-    "PandType",
+    "ProjectType",
     "RegelingCode",
     "TypeAanvrager",
     "UserRole",
@@ -53,7 +53,7 @@ __all__ = [
     "InstallateurLead",
     "RegelingConfig",
     "AAALexProject",
-    "Pand",
+    "Project",
     "Maatregel",
     "MaatregelDocument",
 ]

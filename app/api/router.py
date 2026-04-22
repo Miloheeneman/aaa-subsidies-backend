@@ -8,7 +8,7 @@ from app.api.routes import (
     documenten,
     health,
     installateur,
-    panden,
+    projecten,
     stripe_routes,
     subscriptions,
     subsidiecheck,
@@ -27,4 +27,4 @@ api_router.include_router(aaa_lex.router)
 api_router.include_router(installateur.router)
 api_router.include_router(stripe_routes.router)
 api_router.include_router(subscriptions.router)
-api_router.include_router(panden.router)
+api_router.include_router(projecten.router)

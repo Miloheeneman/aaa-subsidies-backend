@@ -387,7 +387,7 @@ def send_admin_isde_warmtepomp_intake_email(
     *,
     to: str,
     subject: str,
-    pand_adres: str,
+    project_adres: str,
     rows_html: str,
 ) -> None:
     """Admin-notificatie: nieuwe ISDE warmtepomp-intake via klantwizard."""
@@ -396,7 +396,7 @@ def send_admin_isde_warmtepomp_intake_email(
   Er is een nieuwe ISDE warmtepomp-aanvraag binnengekomen via AAA-Subsidies.
 </p>
 <p style="margin:0 0 12px 0;">
-  <strong>Pand:</strong> {html.escape(pand_adres)}
+  <strong>Project:</strong> {html.escape(project_adres)}
 </p>
 <table role="presentation" cellpadding="0" cellspacing="0" border="0"
        style="margin:8px 0 0 0;width:100%;font-size:14px;color:#374151;">
@@ -418,7 +418,7 @@ def send_admin_isde_isolatie_intake_email(
     *,
     to: str,
     subject: str,
-    pand_adres: str,
+    project_adres: str,
     rows_html: str,
 ) -> None:
     """Admin-notificatie: nieuwe ISDE isolatie-intake(s) via klantwizard."""
@@ -428,7 +428,7 @@ def send_admin_isde_isolatie_intake_email(
   (één maatregel per isolatietype).
 </p>
 <p style="margin:0 0 12px 0;">
-  <strong>Pand:</strong> {html.escape(pand_adres)}
+  <strong>Project:</strong> {html.escape(project_adres)}
 </p>
 <table role="presentation" cellpadding="0" cellspacing="0" border="0"
        style="margin:8px 0 0 0;width:100%;font-size:14px;color:#374151;">
@@ -443,4 +443,131 @@ def send_admin_isde_isolatie_intake_email(
         to=to,
         subject=subject,
         html=_wrap("Nieuwe ISDE isolatie aanvraag", body),
+    )
+
+
+def send_admin_eia_intake_email(
+    *,
+    to: str,
+    subject: str,
+    project_adres: str,
+    rows_html: str,
+    urgent: bool,
+) -> None:
+    """Admin-notificatie: nieuwe EIA-intake via klantwizard."""
+    urgent_block = ""
+    if urgent:
+        urgent_block = """\
+<div style="margin:0 0 20px 0;padding:14px 16px;border-radius:10px;
+            background:#fff7ed;border:1px solid #fdba74;color:#9a3412;
+            font-size:14px;font-weight:700;">
+  URGENT — klant heeft aangegeven al een offerte te hebben. Neem vandaag
+  nog contact op om de RVO-deadline te bewaken.
+</div>
+"""
+    body = f"""\
+{urgent_block}
+<p style="margin:0 0 12px 0;">
+  Er is een nieuwe EIA-aanvraag (intake) binnengekomen via AAA-Subsidies.
+</p>
+<p style="margin:0 0 12px 0;">
+  <strong>Project:</strong> {html.escape(project_adres)}
+</p>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0"
+       style="margin:8px 0 0 0;width:100%;font-size:14px;color:#374151;">
+  {rows_html}
+</table>
+<p style="margin:20px 0 0 0;font-size:13px;color:#4b5563;">
+  Log in op het admin-dashboard om het dossier te bekijken en verder te
+  begeleiden.
+</p>
+"""
+    send_email(
+        to=to,
+        subject=subject,
+        html=_wrap("Nieuwe EIA aanvraag", body),
+    )
+
+
+def send_admin_mia_vamil_intake_email(
+    *,
+    to: str,
+    subject: str,
+    project_adres: str,
+    rows_html: str,
+    urgent: bool,
+) -> None:
+    """Admin-notificatie: nieuwe MIA/Vamil-intake via klantwizard."""
+    urgent_block = ""
+    if urgent:
+        urgent_block = """\
+<div style="margin:0 0 20px 0;padding:14px 16px;border-radius:10px;
+            background:#fff7ed;border:1px solid #fdba74;color:#9a3412;
+            font-size:14px;font-weight:700;">
+  URGENT — klant heeft aangegeven al een offerte te hebben. Neem vandaag
+  nog contact op om de RVO-deadline te bewaken.
+</div>
+"""
+    body = f"""\
+{urgent_block}
+<p style="margin:0 0 12px 0;">
+  Er is een nieuwe MIA/Vamil-aanvraag (intake) binnengekomen via
+  AAA-Subsidies.
+</p>
+<p style="margin:0 0 12px 0;">
+  <strong>Project:</strong> {html.escape(project_adres)}
+</p>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0"
+       style="margin:8px 0 0 0;width:100%;font-size:14px;color:#374151;">
+  {rows_html}
+</table>
+<p style="margin:20px 0 0 0;font-size:13px;color:#4b5563;">
+  Log in op het admin-dashboard om het dossier te bekijken en verder te
+  begeleiden.
+</p>
+"""
+    send_email(
+        to=to,
+        subject=subject,
+        html=_wrap("Nieuwe MIA/Vamil aanvraag", body),
+    )
+
+
+def send_admin_dumava_intake_email(
+    *,
+    to: str,
+    subject: str,
+    project_adres: str,
+    rows_html: str,
+) -> None:
+    """Admin-notificatie: DUMAVA-intake (hoge prioriteit i.v.m. budget)."""
+    priority_block = """\
+<div style="margin:0 0 20px 0;padding:14px 16px;border-radius:10px;
+            background:#fef2f2;border:1px solid #fecaca;color:#991b1b;
+            font-size:14px;font-weight:700;">
+  PRIORITEIT — DUMAVA: beperkt RVO-budget en complexe dossiers. Behandel
+  deze intake met voorrang en plant snel een intakegesprek.
+</div>
+"""
+    body = f"""\
+{priority_block}
+<p style="margin:0 0 12px 0;">
+  Er is een nieuwe DUMAVA-intake binnengekomen via AAA-Subsidies.
+</p>
+<p style="margin:0 0 12px 0;">
+  <strong>Project:</strong> {html.escape(project_adres)}
+</p>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0"
+       style="margin:8px 0 0 0;width:100%;font-size:14px;color:#374151;">
+  {rows_html}
+</table>
+<p style="margin:20px 0 0 0;font-size:13px;color:#4b5563;">
+  Log in op het admin-dashboard om de maatregelen te bekijken en verder te
+  begeleiden.
+</p>
+"""
+    send_email(
+        to=to,
+        subject=subject,
+        html=_wrap("Nieuwe DUMAVA aanvraag", body),
     )

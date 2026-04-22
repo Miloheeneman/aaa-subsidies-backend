@@ -1,7 +1,7 @@
-"""Maatregel (measure) linked to a Pand.
+"""Maatregel (measure) linked to a Project.
 
 Represents a single subsidy-eligible investment/installation on one
-Pand. Captures installer details, meldcodes, deadlines, financials and
+Project. Captures installer details, meldcodes, deadlines, financials and
 the chosen regeling.
 """
 from __future__ import annotations
@@ -26,16 +26,16 @@ from app.models.mixins import TimestampMixin, UUIDPKMixin
 
 if TYPE_CHECKING:
     from app.models.maatregel_document import MaatregelDocument
-    from app.models.pand import Pand
+    from app.models.project import Project
     from app.models.user import User
 
 
 class Maatregel(UUIDPKMixin, TimestampMixin, Base):
     __tablename__ = "maatregelen"
 
-    pand_id: Mapped[uuid.UUID] = mapped_column(
+    project_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("panden.id", ondelete="CASCADE"),
+        ForeignKey("projecten.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
@@ -134,7 +134,7 @@ class Maatregel(UUIDPKMixin, TimestampMixin, Base):
     )
 
     # --- Relationships ----------------------------------------------------
-    pand: Mapped["Pand"] = relationship(back_populates="maatregelen")
+    project: Mapped["Project"] = relationship(back_populates="maatregelen")
     creator: Mapped["User"] = relationship(foreign_keys=[created_by])
     documenten: Mapped[List["MaatregelDocument"]] = relationship(
         back_populates="maatregel",

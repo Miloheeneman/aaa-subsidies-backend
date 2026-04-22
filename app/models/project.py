@@ -1,6 +1,6 @@
-"""Pand (building) owned by a klant organisation.
+"""Project (building / dossier) owned by a klant organisation.
 
-Part of STAP 9 — panden module. Each Pand belongs to exactly one
+STAP 9 — projecten module. Each Project belongs to exactly one
 organisation and can have zero-or-more Maatregelen (measures). The
 AAA-Lex-specific fields (energielabel, oppervlakte, notities) are
 filled in by admins after an on-site assessment.
@@ -25,7 +25,7 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
-from app.models.enums import EigenaarType, EnergielabelKlasse, PandType
+from app.models.enums import EigenaarType, EnergielabelKlasse, ProjectType
 from app.models.mixins import TimestampMixin, UUIDPKMixin
 
 if TYPE_CHECKING:
@@ -34,8 +34,8 @@ if TYPE_CHECKING:
     from app.models.user import User
 
 
-class Pand(UUIDPKMixin, TimestampMixin, Base):
-    __tablename__ = "panden"
+class Project(UUIDPKMixin, TimestampMixin, Base):
+    __tablename__ = "projecten"
 
     organisation_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -56,14 +56,14 @@ class Pand(UUIDPKMixin, TimestampMixin, Base):
     postcode: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
     plaats: Mapped[str] = mapped_column(String(128), nullable=False)
 
-    # --- Pandgegevens -----------------------------------------------------
+    # --- Projectgegevens ---------------------------------------------------
     # Bouwjaar is required — it drives the ISDE eligibility check
     # (woning < 2019) and is the first thing AAA-Lex asks for.
     bouwjaar: Mapped[int] = mapped_column(Integer, nullable=False)
-    pand_type: Mapped[PandType] = mapped_column(
+    project_type: Mapped[ProjectType] = mapped_column(
         Enum(
-            PandType,
-            name="pand_type",
+            ProjectType,
+            name="project_type",
             values_callable=lambda enum_cls: [e.value for e in enum_cls],
         ),
         nullable=False,
@@ -118,6 +118,6 @@ class Pand(UUIDPKMixin, TimestampMixin, Base):
     )
     creator: Mapped["User"] = relationship(foreign_keys=[created_by])
     maatregelen: Mapped[List["Maatregel"]] = relationship(
-        back_populates="pand",
+        back_populates="project",
         cascade="all, delete-orphan",
     )

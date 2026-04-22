@@ -1,4 +1,4 @@
-"""Domain services for the panden module (STAP 9).
+"""Domain services for the projecten module (STAP 9).
 
 Three concerns live here:
 
@@ -27,7 +27,7 @@ from app.models.enums import (
     EigenaarType,
     MaatregelDocumentType,
     MaatregelType,
-    PandType,
+    ProjectType,
     RegelingCode,
 )
 
@@ -373,7 +373,7 @@ def estimate_isolatie_subsidie_from_m2(
 
 @dataclass(frozen=True)
 class SubsidieMatch:
-    """One regeling evaluated against a single :class:`Pand`."""
+    """One regeling evaluated against a single :class:`Project`."""
 
     code: str
     naam: str
@@ -387,7 +387,7 @@ class SubsidieMatch:
 
 
 # Een eligibility-check is een lijst van (predikaat, faal-reden) tuples.
-# Predikaten krijgen het pand mee en geven True terug als de voorwaarde
+# Predikaten krijgen het project mee en geven True terug als de voorwaarde
 # voldoet. ``_evaluate`` walkt deze door:
 #   * alle voldaan → eligible=True
 #   * exact 1 niet voldaan → eligible=False met die reden ("bijna" match)
@@ -398,7 +398,7 @@ _Predicate = Tuple[
 ]
 
 
-_WOON_TYPES = {PandType.woning, PandType.appartement}
+_WOON_TYPES = {ProjectType.woning, ProjectType.appartement}
 _PARTICULIER_EIGENAREN = {
     EigenaarType.eigenaar_bewoner,
     EigenaarType.particulier_verhuurder,
@@ -407,16 +407,16 @@ _ISDE_WP_EIGENAREN = _PARTICULIER_EIGENAREN | {
     EigenaarType.zakelijk_verhuurder,
 }
 _EIA_EIGENAREN = {EigenaarType.zakelijk_verhuurder, EigenaarType.overig}
-_EIA_PAND_TYPES = {PandType.kantoor, PandType.bedrijfspand}
-_DUMAVA_PAND_TYPES = {
-    PandType.zorginstelling,
-    PandType.school,
-    PandType.sportaccommodatie,
+_EIA_PROJECT_TYPES = {ProjectType.kantoor, ProjectType.bedrijfspand}
+_DUMAVA_PROJECT_TYPES = {
+    ProjectType.zorginstelling,
+    ProjectType.school,
+    ProjectType.sportaccommodatie,
 }
 
 
 def _evaluate(
-    pand: object,
+    project: object,
     base: dict,
     checks: Iterable[_Predicate],
     *,
@@ -425,7 +425,7 @@ def _evaluate(
     """Run alle predikaten en bouw een :class:`SubsidieMatch` of ``None``."""
     failures: List[str] = []
     for predicate, reason in checks:
-        if not predicate(pand):
+        if not predicate(project):
             failures.append(reason)
 
     if not failures:
@@ -435,7 +435,7 @@ def _evaluate(
     return None
 
 
-def _match_isde_warmtepomp(pand: object) -> Optional[SubsidieMatch]:
+def _match_isde_warmtepomp(project: object) -> Optional[SubsidieMatch]:
     base = dict(
         code="ISDE_WARMTEPOMP",
         naam="ISDE — Warmtepomp",
@@ -448,7 +448,7 @@ def _match_isde_warmtepomp(pand: object) -> Optional[SubsidieMatch]:
         deadline_maanden=24,
     )
     return _evaluate(
-        pand,
+        project,
         base,
         [
             (lambda p: p.bouwjaar < 2019, "Bouwjaar moet vóór 2019 zijn voor ISDE"),
@@ -457,14 +457,14 @@ def _match_isde_warmtepomp(pand: object) -> Optional[SubsidieMatch]:
                 "ISDE warmtepomp is alleen voor eigenaar-bewoners en verhuurders",
             ),
             (
-                lambda p: p.pand_type in _WOON_TYPES,
+                lambda p: p.project_type in _WOON_TYPES,
                 "ISDE warmtepomp is alleen voor woningen of appartementen",
             ),
         ],
     )
 
 
-def _match_isde_isolatie(pand: object) -> Optional[SubsidieMatch]:
+def _match_isde_isolatie(project: object) -> Optional[SubsidieMatch]:
     base = dict(
         code="ISDE_ISOLATIE",
         naam="ISDE — Isolatie",
@@ -477,7 +477,7 @@ def _match_isde_isolatie(pand: object) -> Optional[SubsidieMatch]:
         deadline_maanden=24,
     )
     return _evaluate(
-        pand,
+        project,
         base,
         [
             (lambda p: p.bouwjaar < 2019, "Bouwjaar moet vóór 2019 zijn voor ISDE"),
@@ -486,14 +486,14 @@ def _match_isde_isolatie(pand: object) -> Optional[SubsidieMatch]:
                 "ISDE isolatie is alleen voor eigenaar-bewoners en particuliere verhuurders",
             ),
             (
-                lambda p: p.pand_type in _WOON_TYPES,
+                lambda p: p.project_type in _WOON_TYPES,
                 "ISDE isolatie is alleen voor woningen of appartementen",
             ),
         ],
     )
 
 
-def _match_eia(pand: object) -> Optional[SubsidieMatch]:
+def _match_eia(project: object) -> Optional[SubsidieMatch]:
     base = dict(
         code="EIA",
         naam="EIA — Energie Investeringsaftrek",
@@ -506,7 +506,7 @@ def _match_eia(pand: object) -> Optional[SubsidieMatch]:
         deadline_maanden=3,
     )
     return _evaluate(
-        pand,
+        project,
         base,
         [
             (
@@ -514,14 +514,14 @@ def _match_eia(pand: object) -> Optional[SubsidieMatch]:
                 "EIA is alleen voor zakelijke eigenaren",
             ),
             (
-                lambda p: p.pand_type in _EIA_PAND_TYPES,
-                "EIA is bedoeld voor kantoor- of bedrijfspanden",
+                lambda p: p.project_type in _EIA_PROJECT_TYPES,
+                "EIA is bedoeld voor kantoor- of bedrijfsgebouwen",
             ),
         ],
     )
 
 
-def _match_mia_vamil(pand: object) -> Optional[SubsidieMatch]:
+def _match_mia_vamil(project: object) -> Optional[SubsidieMatch]:
     base = dict(
         code="MIA_VAMIL",
         naam="MIA + Vamil",
@@ -534,7 +534,7 @@ def _match_mia_vamil(pand: object) -> Optional[SubsidieMatch]:
         deadline_maanden=3,
     )
     return _evaluate(
-        pand,
+        project,
         base,
         [
             (
@@ -542,14 +542,14 @@ def _match_mia_vamil(pand: object) -> Optional[SubsidieMatch]:
                 "MIA/Vamil is alleen voor zakelijke eigenaren",
             ),
             (
-                lambda p: p.pand_type in _EIA_PAND_TYPES,
-                "MIA/Vamil is bedoeld voor kantoor- of bedrijfspanden",
+                lambda p: p.project_type in _EIA_PROJECT_TYPES,
+                "MIA/Vamil is bedoeld voor kantoor- of bedrijfsgebouwen",
             ),
         ],
     )
 
 
-def _match_dumava(pand: object) -> Optional[SubsidieMatch]:
+def _match_dumava(project: object) -> Optional[SubsidieMatch]:
     base = dict(
         code="DUMAVA",
         naam="DUMAVA",
@@ -561,30 +561,30 @@ def _match_dumava(pand: object) -> Optional[SubsidieMatch]:
         deadline_type="na_installatie",
         deadline_maanden=24,
     )
-    # Twee aparte routes: maatschappelijk pand, OF VvE met overig pand.
-    is_maatschappelijk = pand.pand_type in _DUMAVA_PAND_TYPES
+    # Twee aparte routes: maatschappelijk vastgoed, OF VvE met overig type.
+    is_maatschappelijk = project.project_type in _DUMAVA_PROJECT_TYPES
     is_vve_overig = (
-        pand.eigenaar_type == EigenaarType.vve
-        and pand.pand_type == PandType.overig
+        project.eigenaar_type == EigenaarType.vve
+        and project.project_type == ProjectType.overig
     )
     if is_maatschappelijk or is_vve_overig:
         return SubsidieMatch(**base, eligible=True, reden=None)
 
-    # "Bijna" match: VvE met een ander panden-type — we melden dat het
+    # "Bijna" match: VvE met een ander project-type — we melden dat het
     # alleen voor maatschappelijk vastgoed of VvE-overig geldt.
-    if pand.eigenaar_type == EigenaarType.vve:
+    if project.eigenaar_type == EigenaarType.vve:
         return SubsidieMatch(
             **base,
             eligible=False,
             reden=(
                 "DUMAVA is voor maatschappelijk vastgoed of VvE met "
-                "pand-type 'overig'"
+                "project-type 'overig'"
             ),
         )
     return None
 
 
-def _match_svve(pand: object) -> Optional[SubsidieMatch]:
+def _match_svve(project: object) -> Optional[SubsidieMatch]:
     base = dict(
         code="SVVE",
         naam="SVVE — VvE verduurzaming",
@@ -594,7 +594,7 @@ def _match_svve(pand: object) -> Optional[SubsidieMatch]:
         deadline_type="na_installatie",
         deadline_maanden=24,
     )
-    if pand.eigenaar_type == EigenaarType.vve:
+    if project.eigenaar_type == EigenaarType.vve:
         return SubsidieMatch(**base, eligible=True, reden=None)
     return None
 
@@ -609,8 +609,8 @@ _MATCHERS = (
 )
 
 
-def get_matching_subsidies(pand: object) -> List[SubsidieMatch]:
-    """Bepaal alle subsidies die voor dit pand relevant zijn.
+def get_matching_subsidies(project: object) -> List[SubsidieMatch]:
+    """Bepaal alle subsidies die voor dit project relevant zijn.
 
     De terugkomende lijst bevat zowel ``eligible=True`` (volledig matchend)
     als ``eligible=False`` (bijna-match, met ``reden``). Niet-relevante
@@ -620,7 +620,7 @@ def get_matching_subsidies(pand: object) -> List[SubsidieMatch]:
     """
     results: List[SubsidieMatch] = []
     for matcher in _MATCHERS:
-        m = matcher(pand)
+        m = matcher(project)
         if m is not None:
             results.append(m)
     return results

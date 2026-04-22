@@ -1,7 +1,7 @@
-"""Panden + maatregelen + maatregel-documenten endpoints (STAP 9).
+"""Projecten + maatregelen + maatregel-documenten endpoints (STAP 9).
 
-Een klant ziet en bewerkt alleen panden van de eigen organisatie; een
-admin ziet panden van alle klanten en kan AAA-Lex-only velden vullen
+Een klant ziet en bewerkt alleen projecten van de eigen organisatie; een
+admin ziet projecten van alle klanten en kan AAA-Lex-only velden vullen
 (energielabels, notities, documenten verifiëren).
 
 De deadline engine wordt op elke POST/PUT van een maatregel opnieuw
@@ -26,7 +26,7 @@ from app.models import (
     Maatregel,
     MaatregelDocument,
     Organisation,
-    Pand,
+    Project,
     User,
 )
 from app.models.enums import (
@@ -37,19 +37,22 @@ from app.models.enums import (
     RegelingCode,
     UserRole,
 )
-from app.schemas.panden import (
+from app.schemas.projecten import (
     ChecklistItemOut,
     ChecklistResponse,
     DocumentOut,
+    EiaAanvraagCreate,
+    MiaVamilAanvraagCreate,
+    DumavaAanvraagCreate,
     MaatregelCreate,
     MaatregelOut,
     MaatregelShort,
     MaatregelUpdate,
-    PandCreate,
-    PandDetailResponse,
-    PandListResponse,
-    PandOut,
-    PandUpdate,
+    ProjectCreate,
+    ProjectDetailResponse,
+    ProjectListResponse,
+    ProjectOut,
+    ProjectUpdate,
     QuotaInfo,
     IsdeIsolatieAanvraagCreate,
     IsdeWarmtepompAanvraagCreate,
@@ -60,10 +63,13 @@ from app.schemas.panden import (
 )
 from app.services import r2_storage
 from app.services.email import (
+    send_admin_eia_intake_email,
     send_admin_isde_isolatie_intake_email,
     send_admin_isde_warmtepomp_intake_email,
+    send_admin_mia_vamil_intake_email,
+    send_admin_dumava_intake_email,
 )
-from app.services.panden_service import (
+from app.services.projecten_service import (
     allowed_document_types,
     calculate_deadline,
     estimate_isolatie_subsidie_from_m2,
@@ -76,7 +82,7 @@ from app.services.plan_service import get_quota
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(tags=["panden"])
+router = APIRouter(tags=["projecten"])
 
 VerifiedUser = Annotated[User, Depends(require_verified)]
 
@@ -90,18 +96,18 @@ def _is_admin(user: User) -> bool:
     return user.role == UserRole.admin
 
 
-def _pand_or_403(db: Session, pand_id: UUID, user: User) -> Pand:
-    pand = db.get(Pand, pand_id)
-    if pand is None or pand.is_deleted:
+def _project_or_403(db: Session, project_id: UUID, user: User) -> Project:
+    project = db.get(Project, project_id)
+    if project is None or project.is_deleted:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Pand niet gevonden"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project niet gevonden"
         )
-    if not _is_admin(user) and pand.organisation_id != user.organisation_id:
+    if not _is_admin(user) and project.organisation_id != user.organisation_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Geen toegang tot dit pand",
+            detail="Geen toegang tot dit project",
         )
-    return pand
+    return project
 
 
 def _maatregel_or_403(
@@ -113,7 +119,7 @@ def _maatregel_or_403(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Maatregel niet gevonden",
         )
-    _pand_or_403(db, m.pand_id, user)  # raises on access denied
+    _project_or_403(db, m.project_id, user)  # raises on access denied
     return m
 
 
@@ -157,8 +163,8 @@ def _worst_deadline_status(
     return worst
 
 
-def _pand_to_out(pand: Pand, *, maatregelen: List[Maatregel]) -> PandOut:
-    data = PandOut.model_validate(pand)
+def _project_to_out(project: Project, *, maatregelen: List[Maatregel]) -> ProjectOut:
+    data = ProjectOut.model_validate(project)
     data.aantal_maatregelen = len(maatregelen)
     data.worst_deadline_status = _worst_deadline_status(
         [m.deadline_status for m in maatregelen]
@@ -199,47 +205,47 @@ def _auto_estimate_subsidie(
 
 
 # ---------------------------------------------------------------------------
-# Panden CRUD
+# Projecten CRUD
 # ---------------------------------------------------------------------------
 
 
-@router.get("/panden", response_model=PandListResponse)
-def list_panden(
+@router.get("/projecten", response_model=ProjectListResponse)
+def list_projecten(
     user: VerifiedUser,
     db: DbSession,
     deadline_status: Optional[DeadlineStatus] = Query(default=None),
     organisation_id: Optional[UUID] = Query(default=None),
-) -> PandListResponse:
-    """Panden van de ingelogde gebruiker. Admin ziet alles."""
-    stmt = select(Pand).where(Pand.is_deleted.is_(False))
+) -> ProjectListResponse:
+    """Projecten van de ingelogde gebruiker. Admin ziet alles."""
+    stmt = select(Project).where(Project.is_deleted.is_(False))
     if not _is_admin(user):
         if user.organisation_id is None:
-            return PandListResponse(
+            return ProjectListResponse(
                 items=[], totaal=0, quota=_quota_info(db, user)
             )
-        stmt = stmt.where(Pand.organisation_id == user.organisation_id)
+        stmt = stmt.where(Project.organisation_id == user.organisation_id)
     else:
         if organisation_id is not None:
-            stmt = stmt.where(Pand.organisation_id == organisation_id)
+            stmt = stmt.where(Project.organisation_id == organisation_id)
 
-    stmt = stmt.order_by(Pand.created_at.desc())
-    panden = list(db.execute(stmt).scalars().all())
+    stmt = stmt.order_by(Project.created_at.desc())
+    projecten = list(db.execute(stmt).scalars().all())
 
     # Bulk-load maatregelen zodat we geen N+1 hebben op het overzicht.
-    pand_ids = [p.id for p in panden]
-    maatregelen_per_pand: dict[UUID, List[Maatregel]] = {pid: [] for pid in pand_ids}
-    if pand_ids:
+    project_ids = [project.id for project in projecten]
+    maatregelen_per_project: dict[UUID, List[Maatregel]] = {pid: [] for pid in project_ids}
+    if project_ids:
         rows = db.execute(
-            select(Maatregel).where(Maatregel.pand_id.in_(pand_ids))
+            select(Maatregel).where(Maatregel.project_id.in_(project_ids))
         ).scalars().all()
         for m in rows:
-            maatregelen_per_pand[m.pand_id].append(m)
+            maatregelen_per_project[m.project_id].append(m)
 
     # Admins krijgen de organisatie-naam mee zodat het admin-overzicht per
-    # rij kan tonen van welke klant het pand is.
+    # rij kan tonen van welke klant het project is.
     org_names: dict[UUID, str] = {}
-    if _is_admin(user) and panden:
-        org_ids = {p.organisation_id for p in panden}
+    if _is_admin(user) and projecten:
+        org_ids = {project.organisation_id for project in projecten}
         rows = db.execute(
             select(Organisation.id, Organisation.name).where(
                 Organisation.id.in_(org_ids)
@@ -248,33 +254,33 @@ def list_panden(
         org_names = {row[0]: row[1] for row in rows}
 
     items = []
-    for p in panden:
-        out = _pand_to_out(p, maatregelen=maatregelen_per_pand.get(p.id, []))
+    for project in projecten:
+        out = _project_to_out(project, maatregelen=maatregelen_per_project.get(project.id, []))
         if _is_admin(user):
-            out.organisation_name = org_names.get(p.organisation_id)
+            out.organisation_name = org_names.get(project.organisation_id)
         items.append(out)
     if deadline_status is not None:
         items = [i for i in items if i.worst_deadline_status == deadline_status]
 
-    return PandListResponse(
+    return ProjectListResponse(
         items=items, totaal=len(items), quota=_quota_info(db, user)
     )
 
 
 @router.post(
-    "/panden",
-    response_model=PandOut,
+    "/projecten",
+    response_model=ProjectOut,
     status_code=status.HTTP_201_CREATED,
 )
-def create_pand(
-    payload: PandCreate,
+def create_project(
+    payload: ProjectCreate,
     user: VerifiedUser,
     db: DbSession,
-) -> PandOut:
+) -> ProjectOut:
     if user.organisation_id is None and not _is_admin(user):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Account zonder organisatie kan geen panden aanmaken",
+            detail="Account zonder organisatie kan geen projecten aanmaken",
         )
 
     # Plan-limit enforcement — admins slaan we over (zie get_quota).
@@ -289,12 +295,12 @@ def create_pand(
                 "used": quota.used,
                 "message": (
                     f"Uw huidige plan ({quota.plan}) staat {quota.limit} "
-                    f"panden toe. Upgrade voor meer panden."
+                    f"projecten toe. Upgrade voor meer projecten."
                 ),
             },
         )
 
-    pand = Pand(
+    project = Project(
         organisation_id=user.organisation_id,  # type: ignore[arg-type]
         created_by=user.id,
         straat=payload.straat.strip(),
@@ -302,44 +308,44 @@ def create_pand(
         postcode=payload.postcode.strip(),
         plaats=payload.plaats.strip(),
         bouwjaar=payload.bouwjaar,
-        pand_type=payload.pand_type,
+        project_type=payload.project_type,
         eigenaar_type=payload.eigenaar_type,
     )
-    db.add(pand)
+    db.add(project)
     db.commit()
-    db.refresh(pand)
-    return _pand_to_out(pand, maatregelen=[])
+    db.refresh(project)
+    return _project_to_out(project, maatregelen=[])
 
 
-@router.get("/panden/{pand_id}", response_model=PandDetailResponse)
-def get_pand(
-    pand_id: UUID, user: VerifiedUser, db: DbSession
-) -> PandDetailResponse:
-    pand = _pand_or_403(db, pand_id, user)
+@router.get("/projecten/{project_id}", response_model=ProjectDetailResponse)
+def get_project(
+    project_id: UUID, user: VerifiedUser, db: DbSession
+) -> ProjectDetailResponse:
+    project = _project_or_403(db, project_id, user)
     maatregelen = list(
         db.execute(
             select(Maatregel)
-            .where(Maatregel.pand_id == pand_id)
+            .where(Maatregel.project_id == project_id)
             .order_by(Maatregel.created_at.desc())
         )
         .scalars()
         .all()
     )
-    base = _pand_to_out(pand, maatregelen=maatregelen).model_dump()
+    base = _project_to_out(project, maatregelen=maatregelen).model_dump()
     base["maatregelen"] = [MaatregelShort.model_validate(m) for m in maatregelen]
-    return PandDetailResponse.model_validate(base)
+    return ProjectDetailResponse.model_validate(base)
 
 
-@router.put("/panden/{pand_id}", response_model=PandOut)
-def update_pand(
-    pand_id: UUID,
-    payload: PandUpdate,
+@router.put("/projecten/{project_id}", response_model=ProjectOut)
+def update_project(
+    project_id: UUID,
+    payload: ProjectUpdate,
     user: VerifiedUser,
     db: DbSession,
-) -> PandOut:
-    pand = _pand_or_403(db, pand_id, user)
+) -> ProjectOut:
+    project = _project_or_403(db, project_id, user)
 
-    # Klant mag alleen pandgegevens aanpassen; AAA-Lex-velden blijven
+    # Klant mag alleen projectgegevens aanpassen; AAA-Lex-velden blijven
     # read-only tot een admin ze invult.
     klant_fields = {
         "straat",
@@ -347,7 +353,7 @@ def update_pand(
         "postcode",
         "plaats",
         "bouwjaar",
-        "pand_type",
+        "project_type",
         "eigenaar_type",
     }
     admin_fields = {
@@ -363,32 +369,32 @@ def update_pand(
         value = data[field]
         if isinstance(value, str):
             value = value.strip()
-        setattr(pand, field, value)
+        setattr(project, field, value)
     if _is_admin(user):
         for field in admin_fields & data.keys():
-            setattr(pand, field, data[field])
+            setattr(project, field, data[field])
 
     db.commit()
-    db.refresh(pand)
+    db.refresh(project)
 
-    # Aantal maatregelen herberekenen zodat _pand_to_out klopt.
+    # Aantal maatregelen herberekenen zodat _project_to_out klopt.
     maatregelen = list(
-        db.execute(select(Maatregel).where(Maatregel.pand_id == pand.id))
+        db.execute(select(Maatregel).where(Maatregel.project_id == project.id))
         .scalars()
         .all()
     )
-    return _pand_to_out(pand, maatregelen=maatregelen)
+    return _project_to_out(project, maatregelen=maatregelen)
 
 
 @router.delete(
-    "/panden/{pand_id}", status_code=status.HTTP_204_NO_CONTENT
+    "/projecten/{project_id}", status_code=status.HTTP_204_NO_CONTENT
 )
-def delete_pand(
-    pand_id: UUID, user: VerifiedUser, db: DbSession
+def delete_project(
+    project_id: UUID, user: VerifiedUser, db: DbSession
 ) -> Response:
-    pand = _pand_or_403(db, pand_id, user)
-    pand.is_deleted = True
-    pand.deleted_at = datetime.now(timezone.utc)
+    project = _project_or_403(db, project_id, user)
+    project.is_deleted = True
+    project.deleted_at = datetime.now(timezone.utc)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -399,19 +405,19 @@ def delete_pand(
 
 
 @router.get(
-    "/panden/{pand_id}/subsidies",
+    "/projecten/{project_id}/subsidies",
     response_model=SubsidieMatchResponse,
 )
-def get_subsidies_voor_pand(
-    pand_id: UUID, user: VerifiedUser, db: DbSession
+def get_subsidies_voor_project(
+    project_id: UUID, user: VerifiedUser, db: DbSession
 ) -> SubsidieMatchResponse:
-    """Welke subsidies passen bij dit pand?
+    """Welke subsidies passen bij dit project?
 
-    Gebruikt :func:`panden_service.get_matching_subsidies` als single source
+    Gebruikt :func:`projecten_service.get_matching_subsidies` als single source
     of truth en splitst de uitkomst in eligible / niet-eligible voor de UI.
     """
-    pand = _pand_or_403(db, pand_id, user)
-    matches = get_matching_subsidies(pand)
+    project = _project_or_403(db, project_id, user)
+    matches = get_matching_subsidies(project)
     eligible = [
         SubsidieMatchOut(**m.__dict__) for m in matches if m.eligible
     ]
@@ -419,7 +425,7 @@ def get_subsidies_voor_pand(
         SubsidieMatchOut(**m.__dict__) for m in matches if not m.eligible
     ]
     return SubsidieMatchResponse(
-        pand_id=pand.id,
+        project_id=project.id,
         eligible=eligible,
         niet_eligible=niet_eligible,
     )
@@ -446,19 +452,67 @@ def _email_row(label: str, value: object) -> str:
     )
 
 
+def _strip_optional_str(s: Optional[str]) -> Optional[str]:
+    if s is None:
+        return None
+    t = s.strip()
+    return t or None
+
+
+_EIA_TYPE_LABELS: dict[str, str] = {
+    "led": "LED verlichting",
+    "warmtepomp_zakelijk": "Warmtepomp zakelijk",
+    "zonnepanelen": "Zonnepanelen",
+    "energiezuinige_installatie": "Energiezuinige installatie",
+    "overig": "Overig energiebesparend",
+}
+_EIA_ONDERNEMING_LABELS: dict[str, str] = {
+    "ib": "IB-ondernemer (inkomstenbelasting)",
+    "bv_nv": "BV / NV (vennootschapsbelasting)",
+    "overig": "Overig",
+}
+_MIA_MILIEU_TYPE_LABELS: dict[str, str] = {
+    "duurzame_warmte": "Duurzame warmte (warmtepomp, WKO)",
+    "circulair_bouwen": "Circulair bouwen",
+    "energieneutrale_gebouwen": "Energieneutrale gebouwen",
+    "hernieuwbare_energie": "Hernieuwbare energie",
+    "overig_milieu": "Overig milieuvriendelijk",
+}
+_VAMIL_LIQUIDITEIT_INDICATIE_PCT = 0.03
+
+_DUMAVA_ORG_LABELS: dict[str, str] = {
+    "zorg": "Zorginstelling",
+    "onderwijs": "Onderwijs",
+    "sport": "Sport",
+    "gemeente": "Gemeente / overheid",
+    "overig_maatschappelijk": "Overig maatschappelijk",
+}
+_DUMAVA_MAATREGEL_KEY_LABELS: dict[str, str] = {
+    "warmtepomp": "Warmtepomp",
+    "zonnepanelen": "Zonnepanelen",
+    "dakisolatie": "Dakisolatie",
+    "gevelisolatie": "Gevelisolatie",
+    "led_verlichting": "LED verlichting",
+    "warmtenet": "Warmtenet aansluiting",
+    "vloerisolatie": "Vloerisolatie",
+    "overig": "Overige maatregel",
+}
+_DUMAVA_MAX_INVESTERING_PER_GEBOUW = 1_500_000.0
+
+
 @router.post(
-    "/panden/{pand_id}/aanvragen/isde-warmtepomp",
+    "/projecten/{project_id}/aanvragen/isde-warmtepomp",
     response_model=MaatregelOut,
     status_code=status.HTTP_201_CREATED,
 )
 def create_isde_warmtepomp_aanvraag(
-    pand_id: UUID,
+    project_id: UUID,
     payload: IsdeWarmtepompAanvraagCreate,
     user: VerifiedUser,
     db: DbSession,
 ) -> MaatregelOut:
     """Wizard-submit: sla ISDE warmtepomp-intake op als nieuwe maatregel."""
-    pand = _pand_or_403(db, pand_id, user)
+    project = _project_or_403(db, project_id, user)
 
     m_type = MaatregelType(payload.warmtepomp_subtype)
     if m_type not in _ISDE_WP_SUBTYPE_LABELS:
@@ -481,7 +535,7 @@ def create_isde_warmtepomp_aanvraag(
         return t or None
 
     m = Maatregel(
-        pand_id=pand.id,
+        project_id=project.id,
         created_by=user.id,
         maatregel_type=m_type,
         omschrijving=(
@@ -511,10 +565,10 @@ def create_isde_warmtepomp_aanvraag(
     db.commit()
     db.refresh(m)
 
-    pand_adres = (
-        f"{pand.straat} {pand.huisnummer}, {pand.postcode} {pand.plaats}"
+    project_adres = (
+        f"{project.straat} {project.huisnummer}, {project.postcode} {project.plaats}"
     )
-    subject = f"Nieuwe ISDE warmtepomp aanvraag — {pand_adres}"
+    subject = f"Nieuwe ISDE warmtepomp aanvraag — {project_adres}"
 
     situatie_txt = (
         "Ja, al geïnstalleerd"
@@ -571,7 +625,7 @@ def create_isde_warmtepomp_aanvraag(
         send_admin_isde_warmtepomp_intake_email(
             to=admin_to,
             subject=subject,
-            pand_adres=pand_adres,
+            project_adres=project_adres,
             rows_html=rows_html,
         )
 
@@ -587,18 +641,18 @@ _ISOL_WIZARD_LABELS: dict[MaatregelType, str] = {
 
 
 @router.post(
-    "/panden/{pand_id}/aanvragen/isde-isolatie",
+    "/projecten/{project_id}/aanvragen/isde-isolatie",
     response_model=List[MaatregelOut],
     status_code=status.HTTP_201_CREATED,
 )
 def create_isde_isolatie_aanvragen(
-    pand_id: UUID,
+    project_id: UUID,
     payload: IsdeIsolatieAanvraagCreate,
     user: VerifiedUser,
     db: DbSession,
 ) -> List[MaatregelOut]:
-    """Wizard-submit: één Maatregel per gekozen isolatietype op hetzelfde pand."""
-    pand = _pand_or_403(db, pand_id, user)
+    """Wizard-submit: één Maatregel per gekozen isolatietype op hetzelfde project."""
+    project = _project_or_403(db, project_id, user)
 
     def _strip_opt(s: Optional[str]) -> Optional[str]:
         if s is None:
@@ -631,7 +685,7 @@ def create_isde_isolatie_aanvragen(
         )
 
         m = Maatregel(
-            pand_id=pand.id,
+            project_id=project.id,
             created_by=user.id,
             maatregel_type=mt,
             omschrijving=oms,
@@ -655,10 +709,10 @@ def create_isde_isolatie_aanvragen(
     for m in created:
         db.refresh(m)
 
-    pand_adres = (
-        f"{pand.straat} {pand.huisnummer}, {pand.postcode} {pand.plaats}"
+    project_adres = (
+        f"{project.straat} {project.huisnummer}, {project.postcode} {project.plaats}"
     )
-    subject = f"Nieuwe ISDE isolatie aanvraag — {pand_adres}"
+    subject = f"Nieuwe ISDE isolatie aanvraag — {project_adres}"
 
     rows: List[str] = [
         _email_row("Klant-e-mail", user.email),
@@ -738,7 +792,390 @@ def create_isde_isolatie_aanvragen(
         send_admin_isde_isolatie_intake_email(
             to=admin_to,
             subject=subject,
-            pand_adres=pand_adres,
+            project_adres=project_adres,
+            rows_html=rows_html,
+        )
+
+    return [MaatregelOut.model_validate(m) for m in created]
+
+
+@router.post(
+    "/projecten/{project_id}/aanvragen/eia",
+    response_model=MaatregelOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_eia_aanvraag(
+    project_id: UUID,
+    payload: EiaAanvraagCreate,
+    user: VerifiedUser,
+    db: DbSession,
+) -> MaatregelOut:
+    """Wizard-submit: EIA-intake als één Maatregel (eia_investering, EIA)."""
+    project = _project_or_403(db, project_id, user)
+    type_label = _EIA_TYPE_LABELS[payload.type_investering]
+    ond_label = _EIA_ONDERNEMING_LABELS[payload.type_onderneming]
+    contact_naam = _strip_optional_str(payload.contactpersoon_naam)
+    tel = _strip_optional_str(payload.telefoon)
+
+    oms_lines = [
+        payload.investering_omschrijving.strip(),
+        "",
+        "--- EIA intake (klantwizard) ---",
+        f"Type investering: {type_label}",
+        f"Bedrijfsnaam: {payload.bedrijfsnaam.strip()}",
+        f"KvK: {payload.kvk_nummer}",
+        f"Type onderneming: {ond_label}",
+    ]
+    if contact_naam:
+        oms_lines.append(f"Contactpersoon: {contact_naam}")
+    if tel:
+        oms_lines.append(f"Telefoon: {tel}")
+    oms = "\n".join(oms_lines)
+
+    urgent = bool(payload.heeft_offerte and payload.offerte_datum)
+    m_status = (
+        MaatregelStatus.gepland
+        if urgent or payload.geplande_startdatum is not None
+        else MaatregelStatus.orientatie
+    )
+
+    m = Maatregel(
+        project_id=project.id,
+        created_by=user.id,
+        maatregel_type=MaatregelType.eia_investering,
+        omschrijving=oms,
+        status=m_status,
+        apparaat_merk=type_label[:128],
+        installateur_naam=payload.bedrijfsnaam.strip(),
+        installateur_kvk=payload.kvk_nummer,
+        installateur_gecertificeerd=False,
+        installatie_datum=payload.geplande_startdatum,
+        offerte_datum=payload.offerte_datum,
+        investering_bedrag=float(payload.investering_bedrag),
+        regeling_code=RegelingCode.EIA,
+    )
+    _recalc_deadline(m)
+    if urgent:
+        m.deadline_status = DeadlineStatus.kritiek
+    _auto_estimate_subsidie(m)
+    db.add(m)
+    db.commit()
+    db.refresh(m)
+
+    project_adres = (
+        f"{project.straat} {project.huisnummer}, {project.postcode} {project.plaats}"
+    )
+    subject = (
+        "[URGENT] Nieuwe EIA aanvraag — " if urgent else "Nieuwe EIA aanvraag — "
+    ) + project_adres
+
+    rows: List[str] = [
+        _email_row("Klant-e-mail", user.email),
+        _email_row("Bedrijfsnaam", payload.bedrijfsnaam.strip()),
+        _email_row("KvK", payload.kvk_nummer),
+        _email_row("Type investering", type_label),
+        _email_row(
+            "Geschatte investering (€)",
+            f"{float(payload.investering_bedrag):.2f}",
+        ),
+        _email_row(
+            "Geplande startdatum",
+            payload.geplande_startdatum.isoformat()
+            if payload.geplande_startdatum
+            else None,
+        ),
+        _email_row("Al een offerte?", "Ja" if payload.heeft_offerte else "Nee"),
+        _email_row(
+            "Offertedatum",
+            payload.offerte_datum.isoformat() if payload.offerte_datum else None,
+        ),
+        _email_row(
+            "Deadline RVO (indicatie +3 mnd)",
+            m.deadline_indienen.isoformat() if m.deadline_indienen else None,
+        ),
+        _email_row(
+            "Geschatte fiscale aftrek (€)",
+            f"{m.geschatte_subsidie:.2f}" if m.geschatte_subsidie else None,
+        ),
+        _email_row("Contactpersoon", contact_naam),
+        _email_row("Telefoon", tel),
+        _email_row("Maatregel-ID", str(m.id)),
+    ]
+    rows_html = "".join(rows)
+    for admin_to in _admin_notification_recipients(db):
+        send_admin_eia_intake_email(
+            to=admin_to,
+            subject=subject,
+            project_adres=project_adres,
+            rows_html=rows_html,
+            urgent=urgent,
+        )
+
+    return MaatregelOut.model_validate(m)
+
+
+@router.post(
+    "/projecten/{project_id}/aanvragen/mia-vamil",
+    response_model=MaatregelOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_mia_vamil_aanvraag(
+    project_id: UUID,
+    payload: MiaVamilAanvraagCreate,
+    user: VerifiedUser,
+    db: DbSession,
+) -> MaatregelOut:
+    """Wizard-submit: MIA + Vamil-intake als één Maatregel (gecombineerd)."""
+    project = _project_or_403(db, project_id, user)
+    type_label = _MIA_MILIEU_TYPE_LABELS[payload.type_milieu_investering]
+    ond_label = _EIA_ONDERNEMING_LABELS[payload.type_onderneming]
+    contact_naam = _strip_optional_str(payload.contactpersoon_naam)
+    tel = _strip_optional_str(payload.telefoon)
+
+    oms_lines = [
+        payload.investering_omschrijving.strip(),
+        "",
+        "--- MIA/Vamil intake (klantwizard) ---",
+        f"Type milieu-investering: {type_label}",
+    ]
+    if payload.milieulijst_categoriecode:
+        oms_lines.append(
+            f"Milieulijst categoriecode (klant): {payload.milieulijst_categoriecode}"
+        )
+    oms_lines.extend(
+        [
+            f"Bedrijfsnaam: {payload.bedrijfsnaam.strip()}",
+            f"KvK: {payload.kvk_nummer}",
+            f"Type onderneming: {ond_label}",
+        ]
+    )
+    if contact_naam:
+        oms_lines.append(f"Contactpersoon: {contact_naam}")
+    if tel:
+        oms_lines.append(f"Telefoon: {tel}")
+    oms = "\n".join(oms_lines)
+
+    urgent = bool(payload.heeft_offerte and payload.offerte_datum)
+    m_status = (
+        MaatregelStatus.gepland
+        if urgent or payload.geplande_startdatum is not None
+        else MaatregelStatus.orientatie
+    )
+
+    m = Maatregel(
+        project_id=project.id,
+        created_by=user.id,
+        maatregel_type=MaatregelType.mia_vamil_investering,
+        omschrijving=oms,
+        status=m_status,
+        apparaat_merk=type_label[:128],
+        installateur_naam=payload.bedrijfsnaam.strip(),
+        installateur_kvk=payload.kvk_nummer,
+        installateur_gecertificeerd=False,
+        installatie_datum=payload.geplande_startdatum,
+        offerte_datum=payload.offerte_datum,
+        investering_bedrag=float(payload.investering_bedrag),
+        regeling_code=RegelingCode.MIA,
+    )
+    _recalc_deadline(m)
+    if urgent:
+        m.deadline_status = DeadlineStatus.kritiek
+    _auto_estimate_subsidie(m)
+    db.add(m)
+    db.commit()
+    db.refresh(m)
+
+    inv = float(payload.investering_bedrag)
+    vamil_indicatie = round(inv * _VAMIL_LIQUIDITEIT_INDICATIE_PCT, 2)
+
+    project_adres = (
+        f"{project.straat} {project.huisnummer}, {project.postcode} {project.plaats}"
+    )
+    subject = (
+        "[URGENT] Nieuwe MIA/Vamil aanvraag — "
+        if urgent
+        else "Nieuwe MIA/Vamil aanvraag — "
+    ) + project_adres
+
+    rows: List[str] = [
+        _email_row("Klant-e-mail", user.email),
+        _email_row("Bedrijfsnaam", payload.bedrijfsnaam.strip()),
+        _email_row("KvK", payload.kvk_nummer),
+        _email_row("Type milieu-investering", type_label),
+        _email_row("Milieulijst categoriecode", payload.milieulijst_categoriecode),
+        _email_row(
+            "Geschatte investering (€)",
+            f"{inv:.2f}",
+        ),
+        _email_row(
+            "Geplande startdatum",
+            payload.geplande_startdatum.isoformat()
+            if payload.geplande_startdatum
+            else None,
+        ),
+        _email_row("Al een offerte?", "Ja" if payload.heeft_offerte else "Nee"),
+        _email_row(
+            "Offertedatum",
+            payload.offerte_datum.isoformat() if payload.offerte_datum else None,
+        ),
+        _email_row(
+            "Deadline RVO (indicatie +3 mnd)",
+            m.deadline_indienen.isoformat() if m.deadline_indienen else None,
+        ),
+        _email_row(
+            "Geschatte MIA-aftrek (36%) (€)",
+            f"{m.geschatte_subsidie:.2f}" if m.geschatte_subsidie else None,
+        ),
+        _email_row(
+            "Vamil liquiditeit (indicatie 3%) (€)",
+            f"{vamil_indicatie:.2f}",
+        ),
+        _email_row("Contactpersoon", contact_naam),
+        _email_row("Telefoon", tel),
+        _email_row("Maatregel-ID", str(m.id)),
+    ]
+    rows_html = "".join(rows)
+    for admin_to in _admin_notification_recipients(db):
+        send_admin_mia_vamil_intake_email(
+            to=admin_to,
+            subject=subject,
+            project_adres=project_adres,
+            rows_html=rows_html,
+            urgent=urgent,
+        )
+
+    return MaatregelOut.model_validate(m)
+
+
+@router.post(
+    "/projecten/{project_id}/aanvragen/dumava",
+    response_model=List[MaatregelOut],
+    status_code=status.HTTP_201_CREATED,
+)
+def create_dumava_aanvragen(
+    project_id: UUID,
+    payload: DumavaAanvraagCreate,
+    user: VerifiedUser,
+    db: DbSession,
+) -> List[MaatregelOut]:
+    """Wizard-submit: één DUMAVA-maatregel per gekozen onderdeel op het project."""
+    project = _project_or_403(db, project_id, user)
+    org_label = _DUMAVA_ORG_LABELS[payload.organisatie_type]
+    functie_s = _strip_optional_str(payload.contact_functie)
+
+    energie_line = payload.energielabel_huidig
+    shared_tail = (
+        f"Organisatie-type: {org_label}\n"
+        f"Oppervlakte gebouw: {payload.oppervlakte_m2:g} m²\n"
+        f"Bouwjaar: {payload.bouwjaar}\n"
+        f"Huidig energielabel: {energie_line or '—'}\n"
+        f"EPA-maatwerkadvies reeds aanwezig: "
+        f"{'Ja' if payload.heeft_maatwerkadvies else 'Nee'}\n"
+        f"Contactpersoon: {payload.contactpersoon_naam.strip()}\n"
+        f"Functie: {functie_s or '—'}\n"
+        f"Telefoon: {payload.telefoon.strip()}\n"
+        f"Eerder contact met RVO over dit project: "
+        f"{'Ja' if payload.rvo_contact_gehad else 'Nee'}"
+    )
+
+    created: List[Maatregel] = []
+    for item in payload.items:
+        label = _DUMAVA_MAATREGEL_KEY_LABELS[item.maatregel_key]
+        oms = (
+            f"{item.beschrijving.strip()}\n\n"
+            "--- DUMAVA wizard (gedeelde gegevens) ---\n"
+            f"Maatregel-onderdeel: {label}\n"
+            f"{shared_tail}"
+        )
+        m = Maatregel(
+            project_id=project.id,
+            created_by=user.id,
+            maatregel_type=MaatregelType.dumava_maatregel,
+            omschrijving=oms,
+            status=MaatregelStatus.orientatie,
+            apparaat_merk=label[:128],
+            apparaat_typenummer=item.maatregel_key[:128],
+            installateur_naam=payload.contactpersoon_naam.strip(),
+            installateur_kvk=None,
+            installateur_gecertificeerd=False,
+            investering_bedrag=float(item.investering_bedrag),
+            regeling_code=RegelingCode.DUMAVA,
+        )
+        _recalc_deadline(m)
+        _auto_estimate_subsidie(m)
+        db.add(m)
+        created.append(m)
+
+    db.commit()
+    for m in created:
+        db.refresh(m)
+
+    project_adres = (
+        f"{project.straat} {project.huisnummer}, {project.postcode} {project.plaats}"
+    )
+    totaal_inv = sum(float(i.investering_bedrag) for i in payload.items)
+    totaal_sub = sum(float(m.geschatte_subsidie or 0) for m in created)
+    subject = f"[DUMAVA — prioriteit] Nieuwe intake — {project_adres}"
+
+    rows: List[str] = [
+        _email_row("Klant-e-mail", user.email),
+        _email_row("Organisatie-type", org_label),
+        _email_row("Contactpersoon", payload.contactpersoon_naam.strip()),
+        _email_row("Functie", functie_s),
+        _email_row("Telefoon", payload.telefoon.strip()),
+        _email_row(
+            "Eerder contact RVO",
+            "Ja" if payload.rvo_contact_gehad else "Nee",
+        ),
+        _email_row("Oppervlakte gebouw (m²)", f"{payload.oppervlakte_m2:g}"),
+        _email_row("Bouwjaar", str(payload.bouwjaar)),
+        _email_row("Energielabel", energie_line),
+        _email_row(
+            "EPA-maatwerkadvies aanwezig",
+            "Ja" if payload.heeft_maatwerkadvies else "Nee",
+        ),
+        _email_row(
+            "Totaal investering maatregelen (€)",
+            f"{totaal_inv:.2f}",
+        ),
+        _email_row(
+            "Som geschatte DUMAVA (30%) (€)",
+            f"{totaal_sub:.2f}" if totaal_sub else None,
+        ),
+    ]
+    if totaal_inv > _DUMAVA_MAX_INVESTERING_PER_GEBOUW:
+        rows.append(
+            _email_row(
+                "Let op",
+                "Totaalinvestering overschrijdt indicatief €1.500.000 per gebouw; "
+                "controleer subsidiabele kosten bij RVO.",
+            )
+        )
+    for idx, m in enumerate(created):
+        if idx:
+            rows.append(
+                '<tr><td colspan="2" style="padding:8px 0;border-top:1px solid #e5e7eb;"></td></tr>'
+            )
+        w_item = payload.items[idx]
+        lab = _DUMAVA_MAATREGEL_KEY_LABELS[w_item.maatregel_key]
+        rows.append(_email_row("Maatregel", lab))
+        rows.append(
+            _email_row("Investering (€)", f"{w_item.investering_bedrag:.2f}")
+        )
+        rows.append(
+            _email_row(
+                "Geschatte DUMAVA (€)",
+                f"{m.geschatte_subsidie:.2f}" if m.geschatte_subsidie else None,
+            )
+        )
+        rows.append(_email_row("Maatregel-ID", str(m.id)))
+
+    rows_html = "".join(rows)
+    for admin_to in _admin_notification_recipients(db):
+        send_admin_dumava_intake_email(
+            to=admin_to,
+            subject=subject,
+            project_adres=project_adres,
             rows_html=rows_html,
         )
 
@@ -746,17 +1183,17 @@ def create_isde_isolatie_aanvragen(
 
 
 @router.get(
-    "/panden/{pand_id}/maatregelen",
+    "/projecten/{project_id}/maatregelen",
     response_model=List[MaatregelOut],
 )
 def list_maatregelen(
-    pand_id: UUID, user: VerifiedUser, db: DbSession
+    project_id: UUID, user: VerifiedUser, db: DbSession
 ) -> List[MaatregelOut]:
-    _pand_or_403(db, pand_id, user)
+    _project_or_403(db, project_id, user)
     rows = (
         db.execute(
             select(Maatregel)
-            .where(Maatregel.pand_id == pand_id)
+            .where(Maatregel.project_id == project_id)
             .order_by(Maatregel.created_at.desc())
         )
         .scalars()
@@ -766,17 +1203,17 @@ def list_maatregelen(
 
 
 @router.post(
-    "/panden/{pand_id}/maatregelen",
+    "/projecten/{project_id}/maatregelen",
     response_model=MaatregelOut,
     status_code=status.HTTP_201_CREATED,
 )
 def create_maatregel(
-    pand_id: UUID,
+    project_id: UUID,
     payload: MaatregelCreate,
     user: VerifiedUser,
     db: DbSession,
 ) -> MaatregelOut:
-    pand = _pand_or_403(db, pand_id, user)
+    project = _project_or_403(db, project_id, user)
 
     if payload.maatregel_type is None:
         raise HTTPException(
@@ -785,7 +1222,7 @@ def create_maatregel(
         )
 
     m = Maatregel(
-        pand_id=pand.id,
+        project_id=project.id,
         created_by=user.id,
         maatregel_type=payload.maatregel_type,
         omschrijving=payload.omschrijving,
@@ -993,11 +1430,11 @@ def create_document(
             ),
         )
 
-    pand = db.get(Pand, m.pand_id)
-    assert pand is not None
+    project = db.get(Project, m.project_id)
+    assert project is not None
     document_id = uuid4()
     object_key = (
-        f"{pand.organisation_id}/panden/{pand.id}/maatregelen/{m.id}/"
+        f"{project.organisation_id}/projecten/{project.id}/maatregelen/{m.id}/"
         f"{document_id}/{r2_storage.safe_filename(payload.bestandsnaam)}"
     )
 
@@ -1144,7 +1581,7 @@ def download_document(
 
 
 @router.get(
-    "/admin/panden/kritieke-deadlines",
+    "/admin/projecten/kritieke-deadlines",
     response_model=List[MaatregelOut],
 )
 def kritieke_deadlines(

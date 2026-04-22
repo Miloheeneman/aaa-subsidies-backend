@@ -1,11 +1,12 @@
-"""Pydantic schemas for the panden module (STAP 9)."""
+"""Pydantic schemas for the projecten module (STAP 9)."""
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from typing import List, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.models.enums import (
     DeadlineStatus,
@@ -15,31 +16,31 @@ from app.models.enums import (
     MaatregelDocumentType,
     MaatregelStatus,
     MaatregelType,
-    PandType,
+    ProjectType,
     RegelingCode,
 )
 
 
 # ---------------------------------------------------------------------------
-# Panden
+# Projecten
 # ---------------------------------------------------------------------------
 
 
-class PandBase(BaseModel):
+class ProjectBase(BaseModel):
     straat: str = Field(min_length=1, max_length=255)
     huisnummer: str = Field(min_length=1, max_length=32)
     postcode: str = Field(min_length=4, max_length=16)
     plaats: str = Field(min_length=1, max_length=128)
     bouwjaar: int = Field(ge=1500, le=2100)
-    pand_type: PandType
+    project_type: ProjectType
     eigenaar_type: EigenaarType
 
 
-class PandCreate(PandBase):
+class ProjectCreate(ProjectBase):
     pass
 
 
-class PandUpdate(BaseModel):
+class ProjectUpdate(BaseModel):
     """All fields optional; only the fields you send get overwritten."""
 
     straat: Optional[str] = Field(default=None, min_length=1, max_length=255)
@@ -47,11 +48,11 @@ class PandUpdate(BaseModel):
     postcode: Optional[str] = Field(default=None, min_length=4, max_length=16)
     plaats: Optional[str] = Field(default=None, min_length=1, max_length=128)
     bouwjaar: Optional[int] = Field(default=None, ge=1500, le=2100)
-    pand_type: Optional[PandType] = None
+    project_type: Optional[ProjectType] = None
     eigenaar_type: Optional[EigenaarType] = None
 
     # AAA-Lex-only velden — worden door het backend stilletjes genegeerd
-    # voor niet-admins (zie routes/panden.py).
+    # voor niet-admins (zie routes/projecten.py).
     energielabel_huidig: Optional[EnergielabelKlasse] = None
     energielabel_na_maatregelen: Optional[EnergielabelKlasse] = None
     oppervlakte_m2: Optional[float] = Field(default=None, ge=0)
@@ -71,7 +72,7 @@ class MaatregelShort(BaseModel):
     deadline_status: Optional[DeadlineStatus] = None
 
 
-class PandOut(BaseModel):
+class ProjectOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
@@ -83,7 +84,7 @@ class PandOut(BaseModel):
     postcode: str
     plaats: str
     bouwjaar: int
-    pand_type: PandType
+    project_type: ProjectType
     eigenaar_type: EigenaarType
 
     energielabel_huidig: Optional[EnergielabelKlasse] = None
@@ -101,13 +102,13 @@ class PandOut(BaseModel):
     organisation_name: Optional[str] = None  # alleen gevuld voor admins
 
 
-class PandListResponse(BaseModel):
-    items: List[PandOut]
+class ProjectListResponse(BaseModel):
+    items: List[ProjectOut]
     totaal: int
     quota: "QuotaInfo"
 
 
-class PandDetailResponse(PandOut):
+class ProjectDetailResponse(ProjectOut):
     maatregelen: List[MaatregelShort] = []
 
 
@@ -144,7 +145,7 @@ class MaatregelOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
-    pand_id: UUID
+    project_id: UUID
     created_by: UUID
 
     maatregel_type: MaatregelType
@@ -244,7 +245,7 @@ class QuotaInfo(BaseModel):
 
 
 class SubsidieMatchOut(BaseModel):
-    """Eén regeling-match voor een pand (zie panden_service.SubsidieMatch)."""
+    """Eén regeling-match voor een project (zie projecten_service.SubsidieMatch)."""
 
     code: str
     naam: str
@@ -258,7 +259,7 @@ class SubsidieMatchOut(BaseModel):
 
 
 class SubsidieMatchResponse(BaseModel):
-    pand_id: UUID
+    project_id: UUID
     eligible: List[SubsidieMatchOut]
     niet_eligible: List[SubsidieMatchOut]
 
@@ -309,6 +310,181 @@ class IsdeIsolatieTypeIn(BaseModel):
         return self
 
 
+class EiaAanvraagCreate(BaseModel):
+    """Payload voor de EIA intake-wizard (klant)."""
+
+    investering_omschrijving: str = Field(min_length=1, max_length=8000)
+    type_investering: Literal[
+        "led",
+        "warmtepomp_zakelijk",
+        "zonnepanelen",
+        "energiezuinige_installatie",
+        "overig",
+    ]
+    investering_bedrag: float = Field(ge=2500)
+    geplande_startdatum: Optional[date] = None
+    heeft_offerte: bool = False
+    offerte_datum: Optional[date] = None
+
+    bedrijfsnaam: str = Field(min_length=1, max_length=255)
+    kvk_nummer: str = Field(min_length=8, max_length=14)
+    type_onderneming: Literal["ib", "bv_nv", "overig"]
+    contactpersoon_naam: Optional[str] = Field(default=None, max_length=255)
+    telefoon: Optional[str] = Field(default=None, max_length=32)
+
+    @field_validator("kvk_nummer", mode="before")
+    @classmethod
+    def _normalize_kvk(cls, v: object) -> str:
+        if v is None:
+            raise ValueError("KvK-nummer is verplicht")
+        digits = re.sub(r"\D", "", str(v))
+        if len(digits) != 8:
+            raise ValueError("KvK-nummer moet 8 cijfers zijn")
+        return digits
+
+    @model_validator(mode="after")
+    def _offerte_datum(self) -> "EiaAanvraagCreate":
+        if self.heeft_offerte and self.offerte_datum is None:
+            raise ValueError("Vul de offertedatum in wanneer u al een offerte heeft")
+        if not self.heeft_offerte:
+            object.__setattr__(self, "offerte_datum", None)
+        return self
+
+
+class MiaVamilAanvraagCreate(BaseModel):
+    """Payload voor de MIA + Vamil intake-wizard (klant; gecombineerd)."""
+
+    investering_omschrijving: str = Field(min_length=1, max_length=8000)
+    type_milieu_investering: Literal[
+        "duurzame_warmte",
+        "circulair_bouwen",
+        "energieneutrale_gebouwen",
+        "hernieuwbare_energie",
+        "overig_milieu",
+    ]
+    milieulijst_categoriecode: Optional[str] = Field(
+        default=None,
+        max_length=64,
+    )
+    investering_bedrag: float = Field(ge=2500)
+    geplande_startdatum: Optional[date] = None
+    heeft_offerte: bool = False
+    offerte_datum: Optional[date] = None
+
+    bedrijfsnaam: str = Field(min_length=1, max_length=255)
+    kvk_nummer: str = Field(min_length=8, max_length=14)
+    type_onderneming: Literal["ib", "bv_nv", "overig"]
+    contactpersoon_naam: Optional[str] = Field(default=None, max_length=255)
+    telefoon: Optional[str] = Field(default=None, max_length=32)
+
+    @field_validator("kvk_nummer", mode="before")
+    @classmethod
+    def _normalize_kvk_mia(cls, v: object) -> str:
+        if v is None:
+            raise ValueError("KvK-nummer is verplicht")
+        digits = re.sub(r"\D", "", str(v))
+        if len(digits) != 8:
+            raise ValueError("KvK-nummer moet 8 cijfers zijn")
+        return digits
+
+    @field_validator("milieulijst_categoriecode", mode="before")
+    @classmethod
+    def _strip_milieulijst(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        t = str(v).strip()
+        return t or None
+
+    @model_validator(mode="after")
+    def _offerte_datum_mia(self) -> "MiaVamilAanvraagCreate":
+        if self.heeft_offerte and self.offerte_datum is None:
+            raise ValueError("Vul de offertedatum in wanneer u al een offerte heeft")
+        if not self.heeft_offerte:
+            object.__setattr__(self, "offerte_datum", None)
+        return self
+
+
+_DUMAVA_ERKENDE_KEYS = frozenset(
+    {
+        "warmtepomp",
+        "zonnepanelen",
+        "dakisolatie",
+        "gevelisolatie",
+        "vloerisolatie",
+    }
+)
+
+
+class DumavaWizardMaatregelIn(BaseModel):
+    """Eén gekozen verduurzamingsonderdeel in de DUMAVA-wizard."""
+
+    maatregel_key: Literal[
+        "warmtepomp",
+        "zonnepanelen",
+        "dakisolatie",
+        "gevelisolatie",
+        "led_verlichting",
+        "warmtenet",
+        "vloerisolatie",
+        "overig",
+    ]
+    beschrijving: str = Field(min_length=1, max_length=8000)
+    investering_bedrag: float = Field(gt=0)
+
+
+class DumavaAanvraagCreate(BaseModel):
+    """Payload voor de DUMAVA intake-wizard (meerdere maatregelen op één project)."""
+
+    organisatie_type: Literal[
+        "zorg",
+        "onderwijs",
+        "sport",
+        "gemeente",
+        "overig_maatschappelijk",
+    ]
+    items: List[DumavaWizardMaatregelIn] = Field(min_length=2, max_length=16)
+    oppervlakte_m2: float = Field(gt=0, le=1_000_000)
+    bouwjaar: int = Field(ge=1500, le=2100)
+    energielabel_huidig: Optional[
+        Literal["A", "B", "C", "D", "E", "F", "G"]
+    ] = None
+    heeft_maatwerkadvies: bool = False
+    contactpersoon_naam: str = Field(min_length=1, max_length=255)
+    contact_functie: Optional[str] = Field(default=None, max_length=255)
+    telefoon: str = Field(min_length=6, max_length=32)
+    rvo_contact_gehad: bool = False
+
+    @field_validator("telefoon", mode="before")
+    @classmethod
+    def _strip_telefoon(cls, v: object) -> str:
+        if v is None:
+            raise ValueError("Telefoonnummer is verplicht")
+        t = str(v).strip()
+        if len(t) < 6:
+            raise ValueError("Telefoonnummer is te kort")
+        return t
+
+    @field_validator("contact_functie", mode="before")
+    @classmethod
+    def _strip_functie(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        t = str(v).strip()
+        return t or None
+
+    @model_validator(mode="after")
+    def _dumava_items(self) -> "DumavaAanvraagCreate":
+        keys = [i.maatregel_key for i in self.items]
+        if len(keys) != len(set(keys)):
+            raise ValueError("Elke maatregel maximaal één keer kiezen")
+        if not any(k in _DUMAVA_ERKENDE_KEYS for k in keys):
+            raise ValueError(
+                "Kies minimaal één erkende maatregel (bijv. warmtepomp, "
+                "zonnepanelen of isolatie)"
+            )
+        return self
+
+
 class IsdeIsolatieAanvraagCreate(BaseModel):
     """Payload voor de ISDE isolatie intake-wizard (meerdere maatregelen)."""
 
@@ -325,4 +501,4 @@ class IsdeIsolatieAanvraagCreate(BaseModel):
         return self
 
 
-PandListResponse.model_rebuild()
+ProjectListResponse.model_rebuild()
